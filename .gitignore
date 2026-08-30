@@ -135,4 +135,6 @@ dmypy.json
 checkpoints/
 *.pt
 *.pth
-data/training_samples/
+data/
+*.zip
+*.tar.gz

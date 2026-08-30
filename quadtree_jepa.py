@@ -63,25 +63,41 @@ class ZAxisFusionBridge(nn.Module):
         })
         self.scale_embed = nn.Embedding(4, embed_dim)
         
-    def get_2d_pos_embed(self, x, y, dim, device):
-        half_dim = dim // 2
-        omega = np.exp(np.arange(0, half_dim // 2, dtype=np.float32) * -(np.log(10000.0) / (half_dim // 2)))
-        emb_x = x * omega
-        emb_y = y * omega
-        emb_x = np.concatenate([np.sin(emb_x), np.cos(emb_x)])
-        emb_y = np.concatenate([np.sin(emb_y), np.cos(emb_y)])
-        return torch.tensor(np.concatenate([emb_x, emb_y]), dtype=torch.float32, device=device).unsqueeze(0)
+        half_dim = embed_dim // 2
+        omega = torch.exp(torch.arange(0, half_dim // 2, dtype=torch.float32) * -(np.log(10000.0) / (half_dim // 2)))
+        self.register_buffer('omega', omega)
+
+    def get_2d_pos_embed_tensor(self, xs, ys, device):
+        omega = self.omega.to(device)
+        emb_x = xs * omega.unsqueeze(0)
+        emb_y = ys * omega.unsqueeze(0)
+        emb_x = torch.cat([torch.sin(emb_x), torch.cos(emb_x)], dim=-1)
+        emb_y = torch.cat([torch.sin(emb_y), torch.cos(emb_y)], dim=-1)
+        return torch.cat([emb_x, emb_y], dim=-1)
 
     def forward(self, patches, metadata):
-        tokens = []
+        if not patches:
+            device = next(self.parameters()).device
+            return torch.empty(0, self.embed_dim, device=device)
+            
+        device = next(self.parameters()).device
+        
+        projected = []
         for patch, meta in zip(patches, metadata):
             z_level = str(meta['Z'])
-            flat_patch = patch.flatten().unsqueeze(0)
-            projected_patch = self.projections[z_level](flat_patch)
-            pe_2d = self.get_2d_pos_embed(meta['X'], meta['Y'], self.embed_dim, projected_patch.device)
-            pe_1d = self.scale_embed(torch.tensor([meta['Z']], device=projected_patch.device))
-            tokens.append(projected_patch + pe_2d + pe_1d)
-        return torch.cat(tokens, dim=0)
+            flat_patch = patch.flatten().unsqueeze(0).to(device)
+            proj = self.projections[z_level](flat_patch)
+            projected.append(proj)
+        projected = torch.cat(projected, dim=0)
+        
+        xs = torch.tensor([m['X'] for m in metadata], dtype=torch.float32, device=device).unsqueeze(1)
+        ys = torch.tensor([m['Y'] for m in metadata], dtype=torch.float32, device=device).unsqueeze(1)
+        zs = torch.tensor([m['Z'] for m in metadata], dtype=torch.long, device=device)
+        
+        pe_2d = self.get_2d_pos_embed_tensor(xs, ys, device)
+        pe_1d = self.scale_embed(zs)
+        
+        return projected + pe_2d + pe_1d
 
 class CrossAttentionPredictor(nn.Module):
     def __init__(self, embed_dim=768, heads=8):
@@ -141,20 +157,21 @@ class QuadtreeJEPA(nn.Module):
         for token, meta in zip(tokens, metadata):
             if meta['Z'] in [0, 1]:
                 context_tokens.append(token)
-            elif meta['Z'] == 3:
+            elif meta['Z'] in [2, 3]:
+                # Both Level 2 (16x16) and Level 3 (8x8) serve as fine-grained target queries
                 target_tokens.append(token)
                 
         if not context_tokens or not target_tokens:
             return None, None, None, None
             
-        c_len = len(context_tokens)
-        t_len = len(target_tokens)
+        c_len = min(len(context_tokens), self.max_seq_len)
+        t_len = min(len(target_tokens), self.max_seq_len)
         
         pad_context = torch.zeros(self.max_seq_len, tokens.size(-1), device=tokens.device)
         pad_target = torch.zeros(self.max_seq_len, tokens.size(-1), device=tokens.device)
         
-        pad_context[:c_len] = torch.stack(context_tokens)
-        pad_target[:t_len] = torch.stack(target_tokens)
+        pad_context[:c_len] = torch.stack(context_tokens[:c_len])
+        pad_target[:t_len] = torch.stack(target_tokens[:t_len])
         
         context_mask = torch.ones(self.max_seq_len, dtype=torch.bool, device=tokens.device)
         context_mask[:c_len] = False
@@ -178,3 +195,62 @@ class QuadtreeJEPA(nn.Module):
         )
         
         return predicted_targets, true_targets, target_mask, t_len
+
+    @torch.no_grad()
+    def extract_features(self, img):
+        """
+        Extracts a multi-scale representation vector (1, embed_dim) for downstream evaluation.
+        Passes all valid quadtree tokens (Levels 0, 1, 2, and 3) through the context encoder.
+        """
+        self.context_encoder.eval()
+        patches, metadata = self.tokenizer(img)
+        if not metadata:
+            return torch.zeros(1, self.z_bridge.embed_dim, device=img.device)
+            
+        tokens = self.z_bridge(patches, metadata)
+        if len(tokens) == 0:
+            return torch.zeros(1, self.z_bridge.embed_dim, device=img.device)
+            
+        seq_len = min(len(tokens), self.max_seq_len)
+        pad_tokens = torch.zeros(1, self.max_seq_len, tokens.size(-1), device=tokens.device)
+        pad_tokens[0, :seq_len] = tokens[:seq_len]
+        
+        context_out = self.context_encoder(pad_tokens)
+        valid_features = context_out[0, :seq_len, :]
+        return valid_features.mean(dim=0, keepdim=True)
+
+
+class QuadtreeClassifier(nn.Module):
+    """
+    End-to-end downstream classifier wrapper for Quadtree-JEPA.
+    Processes dynamic multi-scale tokens through the context encoder and projects to class logits.
+    Supports discriminative fine-tuning (unfrozen backbone) or frozen feature probing.
+    """
+    def __init__(self, jepa_model, num_classes=3):
+        super().__init__()
+        self.tokenizer = jepa_model.tokenizer
+        self.z_bridge = jepa_model.z_bridge
+        self.context_encoder = jepa_model.context_encoder
+        self.max_seq_len = jepa_model.max_seq_len
+        self.head = nn.Linear(jepa_model.z_bridge.embed_dim, num_classes)
+
+    def forward(self, img):
+        if img.dim() == 4 and img.shape[0] == 1:
+            img = img.squeeze(0)
+            
+        patches, metadata = self.tokenizer(img)
+        if not metadata:
+            return torch.zeros(1, self.head.out_features, device=img.device)
+            
+        tokens = self.z_bridge(patches, metadata)
+        if len(tokens) == 0:
+            return torch.zeros(1, self.head.out_features, device=img.device)
+            
+        seq_len = min(len(tokens), self.max_seq_len)
+        pad_tokens = torch.zeros(1, self.max_seq_len, tokens.size(-1), device=tokens.device)
+        pad_tokens[0, :seq_len] = tokens[:seq_len]
+        
+        context_out = self.context_encoder(pad_tokens)
+        valid_features = context_out[0, :seq_len, :]
+        pooled = valid_features.mean(dim=0, keepdim=True)
+        return self.head(pooled)
