@@ -81,21 +81,36 @@ class ZAxisFusionBridge(nn.Module):
             return torch.empty(0, self.embed_dim, device=device)
             
         device = next(self.parameters()).device
+        N = len(patches)
         
-        projected = []
-        for patch, meta in zip(patches, metadata):
+        # High-performance grouped projection: 4 batched matrix multiplies instead of N individual kernel calls
+        level_groups = {'0': [], '1': [], '2': [], '3': []}
+        level_indices = {'0': [], '1': [], '2': [], '3': []}
+        
+        for idx, (patch, meta) in enumerate(zip(patches, metadata)):
             z_level = str(meta['Z'])
-            flat_patch = patch.flatten().unsqueeze(0).to(device)
-            proj = self.projections[z_level](flat_patch)
-            projected.append(proj)
-        projected = torch.cat(projected, dim=0)
+            level_groups[z_level].append(patch.flatten())
+            level_indices[z_level].append(idx)
+            
+        projected = None
+        for z_level, p_list in level_groups.items():
+            if p_list:
+                stacked = torch.stack(p_list).to(device)
+                proj = self.projections[z_level](stacked)
+                if projected is None:
+                    projected = torch.empty(N, self.embed_dim, device=device, dtype=proj.dtype)
+                indices = torch.tensor(level_indices[z_level], device=device)
+                projected[indices] = proj
         
+        if projected is None:
+            return torch.empty(0, self.embed_dim, device=device)
+            
         xs = torch.tensor([m['X'] for m in metadata], dtype=torch.float32, device=device).unsqueeze(1)
         ys = torch.tensor([m['Y'] for m in metadata], dtype=torch.float32, device=device).unsqueeze(1)
         zs = torch.tensor([m['Z'] for m in metadata], dtype=torch.long, device=device)
         
-        pe_2d = self.get_2d_pos_embed_tensor(xs, ys, device)
-        pe_1d = self.scale_embed(zs)
+        pe_2d = self.get_2d_pos_embed_tensor(xs, ys, device).to(projected.dtype)
+        pe_1d = self.scale_embed(zs).to(projected.dtype)
         
         return projected + pe_2d + pe_1d
 
@@ -161,26 +176,24 @@ class QuadtreeJEPA(nn.Module):
                 # Both Level 2 (16x16) and Level 3 (8x8) serve as fine-grained target queries
                 target_tokens.append(token)
                 
+        # Adaptive partition fallback: if an image is smooth (e.g. healthy leaves with only Level 0/1 tokens)
+        # or has no coarse context, partition the available tokens (70% context, 30% target)
+        # so 100% of all images contribute to representation learning.
         if not context_tokens or not target_tokens:
-            return None, None, None, None
+            if len(tokens) < 2:
+                return None, None, None, None
+            n_ctx = max(1, int(len(tokens) * 0.70))
+            context_tokens = [tokens[i] for i in range(n_ctx)]
+            target_tokens = [tokens[i] for i in range(n_ctx, len(tokens))]
+            if not target_tokens:
+                target_tokens = [tokens[-1]]
             
         c_len = min(len(context_tokens), self.max_seq_len)
         t_len = min(len(target_tokens), self.max_seq_len)
         
-        pad_context = torch.zeros(self.max_seq_len, tokens.size(-1), device=tokens.device)
-        pad_target = torch.zeros(self.max_seq_len, tokens.size(-1), device=tokens.device)
-        
-        pad_context[:c_len] = torch.stack(context_tokens[:c_len])
-        pad_target[:t_len] = torch.stack(target_tokens[:t_len])
-        
-        context_mask = torch.ones(self.max_seq_len, dtype=torch.bool, device=tokens.device)
-        context_mask[:c_len] = False
-        
-        target_mask = torch.ones(self.max_seq_len, dtype=torch.bool, device=tokens.device)
-        target_mask[:t_len] = False
-        
-        context_in = pad_context.unsqueeze(0)
-        target_in = pad_target.unsqueeze(0)
+        # Dynamic unpadded sequence tensors: eliminates 800-token zero padding & cuts attention FLOPs drastically
+        context_in = torch.stack(context_tokens[:c_len]).unsqueeze(0)
+        target_in = torch.stack(target_tokens[:t_len]).unsqueeze(0)
         
         context_out = self.context_encoder(context_in)
         
@@ -189,18 +202,16 @@ class QuadtreeJEPA(nn.Module):
             
         predicted_targets = self.predictor(
             context_out, 
-            target_in, 
-            context_mask=context_mask.unsqueeze(0), 
-            target_mask=target_mask
+            target_in
         )
         
-        return predicted_targets, true_targets, target_mask, t_len
+        return predicted_targets, true_targets, None, t_len
 
     @torch.no_grad()
     def extract_features(self, img):
         """
         Extracts a multi-scale representation vector (1, embed_dim) for downstream evaluation.
-        Passes all valid quadtree tokens (Levels 0, 1, 2, and 3) through the context encoder.
+        Passes all valid quadtree tokens (Levels 0, 1, 2, and 3) dynamically through the context encoder.
         """
         self.context_encoder.eval()
         patches, metadata = self.tokenizer(img)
@@ -212,11 +223,10 @@ class QuadtreeJEPA(nn.Module):
             return torch.zeros(1, self.z_bridge.embed_dim, device=img.device)
             
         seq_len = min(len(tokens), self.max_seq_len)
-        pad_tokens = torch.zeros(1, self.max_seq_len, tokens.size(-1), device=tokens.device)
-        pad_tokens[0, :seq_len] = tokens[:seq_len]
+        tokens_in = tokens[:seq_len].unsqueeze(0)
         
-        context_out = self.context_encoder(pad_tokens)
-        valid_features = context_out[0, :seq_len, :]
+        context_out = self.context_encoder(tokens_in)
+        valid_features = context_out[0]
         return valid_features.mean(dim=0, keepdim=True)
 
 
@@ -226,7 +236,7 @@ class QuadtreeClassifier(nn.Module):
     Processes dynamic multi-scale tokens through the context encoder and projects to class logits.
     Supports discriminative fine-tuning (unfrozen backbone) or frozen feature probing.
     """
-    def __init__(self, jepa_model, num_classes=3):
+    def __init__(self, jepa_model, num_classes=18):
         super().__init__()
         self.tokenizer = jepa_model.tokenizer
         self.z_bridge = jepa_model.z_bridge
@@ -247,10 +257,9 @@ class QuadtreeClassifier(nn.Module):
             return torch.zeros(1, self.head.out_features, device=img.device)
             
         seq_len = min(len(tokens), self.max_seq_len)
-        pad_tokens = torch.zeros(1, self.max_seq_len, tokens.size(-1), device=tokens.device)
-        pad_tokens[0, :seq_len] = tokens[:seq_len]
+        tokens_in = tokens[:seq_len].unsqueeze(0)
         
-        context_out = self.context_encoder(pad_tokens)
-        valid_features = context_out[0, :seq_len, :]
+        context_out = self.context_encoder(tokens_in)
+        valid_features = context_out[0]
         pooled = valid_features.mean(dim=0, keepdim=True)
         return self.head(pooled)

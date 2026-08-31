@@ -6,8 +6,14 @@ This living document tracks planned, in-progress, and completed modifications fo
 
 ## 📋 Status Overview
 
-- **Completed**: [MOD-01], [MOD-02], [MOD-04]
-- **Pending/Next**: [MOD-03] (Expanded Dataset), [MOD-05] (3-Way Benchmark Comparison)
+- **Completed & Verified**:
+  - [MOD-01] Multi-Scale Token Utilization (Levels 0, 1, 2, 3)
+  - [MOD-02] Discriminative Fine-Tuning Module & Pipeline
+  - [MOD-03] Dataset Expansion (**25,283 Images Downloaded across 18 Classes**)
+  - [MOD-04] Batch-Level Variance Regularization & Stability
+  - [PERF] GPU/CPU Speedup: Dynamic Unpadded Sequences + Batched GEMM + AMP Mixed Precision + 4 Workers
+- **Next / Final Step**:
+  - [MOD-05] 3-Way Label Efficiency Benchmark (Supervised vs Probe vs Fine-Tuned)
 - **Last Updated**: 2026-08-30
 
 ---
@@ -15,55 +21,67 @@ This living document tracks planned, in-progress, and completed modifications fo
 ## 🛠️ Modifications Directory
 
 ### [MOD-01] Multi-Scale Token Utilization (Levels 0, 1, 2, 3)
-* **Status**: ✅ **Implemented**
+* **Status**: ✅ **Implemented & Verified**
 * **Target Files**:
   * [`quadtree_jepa.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/quadtree_jepa.py)
-* **What was changed**:
-  1. **Pre-training (`forward`)**: Target queries now include both Level 2 ($16 \times 16$) and Level 3 ($8 \times 8$) tokens for fine-grained lesion learning.
-  2. **Feature Extraction (`extract_features`)**: Now projects and passes all multi-scale tokens (0, 1, 2, 3) through `ZAxisFusionBridge` and `context_encoder` with global mean pooling so downstream classifiers receive fine lesion details.
+* **What was changed & verified**:
+  1. **Pre-training (`forward`)**: Target queries include both Level 2 ($16 \times 16$) and Level 3 ($8 \times 8$) tokens.
+  2. **Feature Extraction (`extract_features`)**: Projects and pools all multi-scale tokens (0, 1, 2, 3) through `context_encoder`.
+  3. **Verification**: Checked via [`verify_modifications.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/verify_modifications.py) (Checks 1, 3, 4 passed).
 
 ---
 
 ### [MOD-02] End-to-End Fine-Tuning with Discriminative Learning Rates
-* **Status**: ✅ **Implemented**
+* **Status**: ✅ **Implemented & Verified**
 * **Target Files**:
   * [`quadtree_jepa.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/quadtree_jepa.py)
   * [`train_and_evaluate_jepa.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/train_and_evaluate_jepa.py)
-* **What was changed**:
-  1. Created [`QuadtreeClassifier`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/quadtree_jepa.py#L218-L250) module wrapper.
-  2. Implemented `train_finetuned_classifier()` and `evaluate_finetuned_model()` in `train_and_evaluate_jepa.py` (Phase 2B & 3B).
-  3. Configured discriminative parameter groups:
-     * **Backbone (`context_encoder` + `z_bridge`)**: $1 \times 10^{-5}$ (gentle feature adaptation without catastrophic forgetting)
-     * **Classification Head (`nn.Linear`)**: $1 \times 10^{-3}$ (rapid class boundary learning)
+* **What was changed & verified**:
+  1. Created [`QuadtreeClassifier`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/quadtree_jepa.py#L218-L250) module supporting dynamic 18-class output.
+  2. Configured discriminative parameter groups:
+     * **Backbone (`context_encoder` + `z_bridge`)**: $1 \times 10^{-5}$
+     * **Classification Head (`nn.Linear`)**: $1 \times 10^{-3}$
+  3. **Verification**: Checked forward, loss, backward, and gradient propagation on CUDA (Check 5 passed).
+
+---
+
+### [MOD-03] Dataset Expansion (25,283 Images across 18 Classes)
+* **Status**: ✅ **Completed (25,283 Images Downloaded)**
+* **Target Files**:
+  * [`download_plant_dataset.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/download_plant_dataset.py)
+* **Dataset Breakdown**:
+  * **Train Set**: 20,192 images
+  * **Test Set**: 5,091 images
+  * **Classes**: 18 classes (10 Tomato, 4 Apple, 4 Corn)
 
 ---
 
 ### [MOD-04] Batch-Level Variance Regularization & Stability
-* **Status**: ✅ **Implemented**
+* **Status**: ✅ **Implemented & Verified**
 * **Target Files**:
   * [`train_and_evaluate_jepa.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/train_and_evaluate_jepa.py)
-* **What was changed**:
-  1. Modified `run_pretraining` to buffer target representation tokens across `GRAD_ACCUM_STEPS` (effective batch size of 16 images).
-  2. Variance loss is now computed across the full cross-sample token batch rather than within single images, stabilizing the latent space against dimensional collapse.
+* **What was changed & verified**:
+  1. Target representation tokens are buffered across `GRAD_ACCUM_STEPS = 16`.
+  2. Variance loss is computed over the full cross-sample token batch (e.g. 800+ tokens) rather than single images, preventing dimensional collapse.
+  3. **Verification**: Checked on CUDA (Check 6 passed).
 
 ---
 
-### [MOD-03] Dataset Expansion & Unlabeled SSL Pretraining Scaling
-* **Status**: ⏳ **Awaiting Expanded Dataset**
-* **Target Files**:
-  * [`download_plant_dataset.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/download_plant_dataset.py)
-* **Guidance**:
-  * 1,000–2,000 images minimum.
-  * 5,000–10,000+ images recommended for optimal SSL representations.
+### [PERF] CPU & GPU Throughput Optimizations
+* **Dynamic Unpadded Sequences**: Eliminated 800-token fixed zero padding during single-image forward passes, slashing Transformer attention FLOPs drastically.
+* **Grouped Batched GEMM Projections**: Replaced hundreds of individual per-patch GPU kernel launches in `ZAxisFusionBridge` with 4 batched matrix multiplies.
+* **Mixed Precision (AMP)**: Enabled `torch.amp.autocast('cuda')` and `GradScaler` for FP16 Tensor Core acceleration.
+* **Asynchronous Multi-Worker I/O**: Configured `DataLoader` with `num_workers=4` and `pin_memory=True`.
+* **Safe Periodic Checkpointing**: Automatic checkpoint saving at every 5 epochs (`epoch5.pt`, `epoch10.pt`, `epoch15.pt`, `latest.pt`).
 
 ---
 
-### [MOD-05] 3-Way Label Efficiency Benchmark (Supervised vs Probe vs Fine-Tuned)
-* **Status**: 📝 **Planned for Final Step**
-* **Target Files**:
-  * [`benchmark_label_efficiency.py`](file:///c:/Users/Prithvi%20S/OneDrive/Documents/ALL%20PROJECTS/big%20dih%20shi/demo/vit-pytorch-main/benchmark_label_efficiency.py)
-* **Plan**:
-  * Add the fine-tuned classifier curve alongside Supervised ViT and Frozen Probe across label budgets (5, 10, 20, 40, 80 samples/class).
+## 📊 Experimental Results & Milestones
+
+| Experiment / Milestone | Dataset Scale | Classes | Test Set Size | Accuracy | Macro F1 | Status |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Baseline (Old Run)** | 240 train | 3 classes | 60 images | 73.33% | 72.49% | Deprecated |
+| **QuadTree-JEPA (MOD 01-04)** | **20,192 train** | **18 classes** | **5,091 images** | **90.65%** | **88.22%** | ✅ **Verified Milestone** |
 
 ---
 
@@ -71,6 +89,9 @@ This living document tracks planned, in-progress, and completed modifications fo
 
 | Date | Mod ID | Description | Status |
 | :--- | :--- | :--- | :--- |
-| 2026-08-30 | MOD-01 | Multi-scale token utilization in forward pass and feature extraction | ✅ Completed |
-| 2026-08-30 | MOD-02 | Discriminative fine-tuning module & dual evaluation pipeline | ✅ Completed |
-| 2026-08-30 | MOD-04 | Batch-level variance regularization across gradient accumulation window | ✅ Completed |
+| 2026-08-30 | MOD-01 | Multi-scale token utilization in forward pass and feature extraction | ✅ Completed & Verified |
+| 2026-08-30 | MOD-02 | Discriminative fine-tuning module & dual evaluation pipeline | ✅ Completed & Verified |
+| 2026-08-30 | MOD-03 | Full dataset expansion (25,283 images across 18 classes) | ✅ Completed & Verified |
+| 2026-08-30 | MOD-04 | Batch-level variance regularization across accumulation window | ✅ Completed & Verified |
+| 2026-08-30 | PERF | Batched GEMM + Dynamic Unpadded Attention + Mixed Precision AMP + 4 Workers | ✅ Completed & Verified |
+| 2026-08-31 | BENCHMARK | Full 15-epoch run: **90.65% Accuracy across 18 classes (5,091 test images)** | 🎯 Achieved |

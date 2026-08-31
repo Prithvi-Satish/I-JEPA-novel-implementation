@@ -18,10 +18,10 @@ from quadtree_jepa import QuadtreeJEPA, QuadtreeClassifier
 # ==========================================
 # HYPERPARAMETERS & CONFIGURATION
 # ==========================================
-PRETRAIN_EPOCHS = 75
-PROBE_EPOCHS = 40
-FINETUNE_EPOCHS = 25
-BATCH_SIZE = 1  # Processed per image due to dynamic quadtree sequence lengths
+PRETRAIN_EPOCHS = 15
+PROBE_EPOCHS = 20
+FINETUNE_EPOCHS = 15
+BATCH_SIZE = 1  # Dynamic quadtree sequence lengths processed per image
 GRAD_ACCUM_STEPS = 16
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.05
@@ -30,11 +30,14 @@ EMA_MOMENTUM_END = 0.9999
 EMBED_DIM = 768
 MAX_SEQ_LEN = 800
 TARGET_SIZE = 504
+NUM_WORKERS = 4
+CHECKPOINT_INTERVAL = 5  # Save checkpoint every 5 epochs
 CHECKPOINT_DIR = "./checkpoints"
 DATA_DIR = "./data/plant_dataset"
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+use_amp = torch.cuda.is_available()
 
 # ==========================================
 # DATASET DEFINITION
@@ -93,14 +96,17 @@ class TrainingMonitor:
         return std_dev, cos_sim
 
 # ==========================================
-# PHASE 1: SELF-SUPERVISED PRE-TRAINING (MOD-04)
+# PHASE 1: SELF-SUPERVISED PRE-TRAINING (HIGH PERFORMANCE + AMP)
 # ==========================================
 def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
-    print("=" * 65)
+    print("=" * 70)
     print(f"  PHASE 1: SELF-SUPERVISED QUADTREE-JEPA PRE-TRAINING ({PRETRAIN_EPOCHS} EPOCHS)")
-    print("=" * 65)
+    print(f"  Acceleration: Mixed Precision (AMP FP16: {use_amp}) | Workers: {NUM_WORKERS}")
+    print("=" * 70)
     
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     start_time = time.time()
+    
     for epoch in range(1, PRETRAIN_EPOCHS + 1):
         model.train()
         model.target_encoder.eval()
@@ -120,44 +126,49 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
         
         epoch_start = time.time()
         for step, (images, _) in enumerate(train_loader):
-            img = images[0].to(device)  # single image processing
-            pred_targets, true_targets, target_mask, t_len = model(img)
+            img = images[0].to(device, non_blocking=True)
             
-            if pred_targets is None or t_len == 0:
-                continue
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                pred_targets, true_targets, _, t_len = model(img)
                 
-            last_valid_pred = pred_targets
-            last_valid_true = true_targets
-            last_valid_t_len = t_len
+                if pred_targets is None or t_len == 0:
+                    continue
+                    
+                last_valid_pred = pred_targets.detach()
+                last_valid_true = true_targets.detach()
+                last_valid_t_len = t_len
+                    
+                pred_active = pred_targets[0, :t_len, :]
+                true_active = true_targets[0, :t_len, :]
                 
-            pred_active = pred_targets[0, :t_len, :]
-            true_active = true_targets[0, :t_len, :]
-            
-            # Unit norm alignment loss for this image
-            pred_norm = F.normalize(pred_active, p=2, dim=-1)
-            true_norm = F.normalize(true_active, p=2, dim=-1)
-            align_loss = F.mse_loss(pred_norm, true_norm, reduction='sum') / (t_len * EMBED_DIM)
-            
-            accum_preds.append(pred_active)
-            accum_align_losses.append(align_loss)
+                # Unit norm alignment loss
+                pred_norm = F.normalize(pred_active, p=2, dim=-1)
+                true_norm = F.normalize(true_active, p=2, dim=-1)
+                align_loss = F.mse_loss(pred_norm, true_norm, reduction='sum') / (t_len * EMBED_DIM)
+                
+                accum_preds.append(pred_active)
+                accum_align_losses.append(align_loss)
             
             # Batch-level variance regularization across accumulated gradient steps
             if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
                 if len(accum_preds) > 0:
-                    all_pred_tokens = torch.cat(accum_preds, dim=0)
-                    pred_std = torch.sqrt(all_pred_tokens.var(dim=0) + 1e-04)
-                    variance_loss = torch.mean(F.relu(1.0 - pred_std))
+                    with torch.amp.autocast('cuda', enabled=use_amp):
+                        all_pred_tokens = torch.cat(accum_preds, dim=0)
+                        pred_std = torch.sqrt(all_pred_tokens.var(dim=0) + 1e-04)
+                        variance_loss = torch.mean(F.relu(1.0 - pred_std))
+                        
+                        mean_align_loss = torch.stack(accum_align_losses).mean()
+                        total_loss = (mean_align_loss * 10.0) + variance_loss
                     
-                    mean_align_loss = torch.stack(accum_align_losses).mean()
-                    total_loss = (mean_align_loss * 10.0) + variance_loss
-                    
-                    total_loss.backward()
+                    scaler.scale(total_loss).backward()
+                    scaler.unscale_(optimizer)
                     
                     nn.utils.clip_grad_norm_(model.context_encoder.parameters(), max_norm=1.0)
                     nn.utils.clip_grad_norm_(model.predictor.parameters(), max_norm=1.0)
                     nn.utils.clip_grad_norm_(model.z_bridge.parameters(), max_norm=1.0)
                     
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     optimizer.zero_grad()
                     model.update_target_encoder(momentum=alpha)
                     
@@ -173,17 +184,23 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
         avg_loss = running_loss / max(valid_steps, 1)
         if last_valid_pred is not None:
             std_dev, cos_sim = monitor.check(last_valid_pred, last_valid_true, last_valid_t_len, step, epoch)
-            print(f"Epoch [{epoch:02d}/{PRETRAIN_EPOCHS}] ({epoch_duration:.1f}s) | Loss: {avg_loss:.5f} | Latent Std: {std_dev:.4f} | CosSim: {cos_sim:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"Epoch [{epoch:02d}/{PRETRAIN_EPOCHS}] ({epoch_duration/60:.1f}m) | Loss: {avg_loss:.5f} | Latent Std: {std_dev:.4f} | CosSim: {cos_sim:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
         else:
-            print(f"Epoch [{epoch:02d}/{PRETRAIN_EPOCHS}] ({epoch_duration:.1f}s) | Loss: {avg_loss:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"Epoch [{epoch:02d}/{PRETRAIN_EPOCHS}] ({epoch_duration/60:.1f}m) | Loss: {avg_loss:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+        # Periodic checkpoint save
+        if epoch % CHECKPOINT_INTERVAL == 0 or epoch == PRETRAIN_EPOCHS:
+            ckpt_name = f"jepa_plant_epoch{epoch}.pt"
+            torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, ckpt_name))
+            torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "jepa_plant_latest.pt"))
+            print(f"  -> Checkpoint successfully saved: {ckpt_name}")
             
     total_time = (time.time() - start_time) / 60
     print(f"\n Pre-training completed in {total_time:.2f} minutes.")
     
-    # Save pretrained weights
-    ckpt_path = os.path.join(CHECKPOINT_DIR, "jepa_plant_75epochs.pt")
-    torch.save(model.state_dict(), ckpt_path)
-    print(f" Checkpoint saved to: {ckpt_path}\n")
+    final_path = os.path.join(CHECKPOINT_DIR, "jepa_plant_15epochs.pt")
+    torch.save(model.state_dict(), final_path)
+    print(f" Final checkpoint saved to: {final_path}\n")
 
 # ==========================================
 # PHASE 2A: LINEAR PROBING & FEATURE EXTRACTION
@@ -195,23 +212,26 @@ def extract_dataset_embeddings(model, dataset):
     with torch.no_grad():
         for i in range(len(dataset)):
             img, label = dataset[i]
-            img = img.to(device)
-            feat = model.extract_features(img)  # Shape: (1, 768)
-            embeddings.append(feat.cpu().squeeze(0))
+            img = img.to(device, non_blocking=True)
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                feat = model.extract_features(img)
+            embeddings.append(feat.float().cpu().squeeze(0))
             labels.append(label)
+            if (i + 1) % 1000 == 0 or (i + 1) == len(dataset):
+                print(f"  -> Extracted {i+1}/{len(dataset)} features...")
     return torch.stack(embeddings), torch.tensor(labels)
 
-def train_linear_probe(train_feats, train_labels, num_classes=3, epochs=40):
-    print("=" * 65)
-    print("  PHASE 2A: TRAINING LINEAR CLASSIFIER (PROBING FROZEN JEPA FEATURES)")
-    print("=" * 65)
+def train_linear_probe(train_feats, train_labels, num_classes=18, epochs=PROBE_EPOCHS):
+    print("=" * 70)
+    print(f"  PHASE 2A: TRAINING LINEAR CLASSIFIER (PROBING FROZEN JEPA FEATURES, {epochs} EPOCHS)")
+    print("=" * 70)
     
     linear_head = nn.Linear(EMBED_DIM, num_classes).to(device)
     probe_optimizer = torch.optim.Adam(linear_head.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
     
     dataset = torch.utils.data.TensorDataset(train_feats, train_labels)
-    loader = DataLoader(dataset, batch_size=16, shuffle=True)
+    loader = DataLoader(dataset, batch_size=64, shuffle=True)
     
     for epoch in range(1, epochs + 1):
         linear_head.train()
@@ -225,24 +245,21 @@ def train_linear_probe(train_feats, train_labels, num_classes=3, epochs=40):
             probe_optimizer.step()
             running_loss += loss.item()
             
-        if epoch % 10 == 0 or epoch == epochs:
+        if epoch % 5 == 0 or epoch == epochs:
             print(f"Probe Epoch [{epoch:02d}/{epochs}] | Cross-Entropy Loss: {running_loss/len(loader):.4f}")
             
     return linear_head
 
 # ==========================================
-# PHASE 2B: END-TO-END DISCRIMINATIVE FINE-TUNING (MOD-02)
+# PHASE 2B: END-TO-END DISCRIMINATIVE FINE-TUNING
 # ==========================================
-def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=3, epochs=25):
-    print("=" * 65)
+def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, epochs=FINETUNE_EPOCHS):
+    print("=" * 70)
     print(f"  PHASE 2B: END-TO-END DISCRIMINATIVE FINE-TUNING ({epochs} EPOCHS)")
-    print("=" * 65)
+    print("=" * 70)
     
     classifier = QuadtreeClassifier(base_jepa_model, num_classes=num_classes).to(device)
     
-    # Discriminative parameter groups
-    # Backbone: 1e-5 (gentle adaptation, preserves SSL priors)
-    # Head: 1e-3 (rapid convergence on class decision boundaries)
     param_groups = [
         {"params": classifier.context_encoder.parameters(), "lr": 1e-5, "weight_decay": 0.05},
         {"params": classifier.z_bridge.parameters(), "lr": 1e-5, "weight_decay": 0.05},
@@ -252,8 +269,9 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=3, ep
     optimizer = torch.optim.AdamW(param_groups)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     criterion = nn.CrossEntropyLoss()
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     
-    loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
     
     for epoch in range(1, epochs + 1):
         classifier.train()
@@ -261,17 +279,21 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=3, ep
         optimizer.zero_grad()
         
         for step, (images, labels) in enumerate(loader):
-            img = images[0].to(device)
-            label = labels.to(device)
+            img = images[0].to(device, non_blocking=True)
+            label = labels.to(device, non_blocking=True)
             
-            logits = classifier(img)
-            loss = criterion(logits, label) / GRAD_ACCUM_STEPS
-            loss.backward()
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                logits = classifier(img)
+                loss = criterion(logits, label) / GRAD_ACCUM_STEPS
+                
+            scaler.scale(loss).backward()
             running_loss += loss.item() * GRAD_ACCUM_STEPS
             
             if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(loader):
+                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(classifier.parameters(), max_norm=1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
                 
         scheduler.step()
@@ -284,9 +306,9 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=3, ep
 # PHASE 3: EVALUATION & METRIC CALCULATION
 # ==========================================
 def evaluate_model(linear_head, test_feats, test_labels, class_names):
-    print("\n" + "=" * 65)
-    print("  PHASE 3A: BENCHMARK EVALUATION (FROZEN LINEAR PROBE - 60 IMAGES)")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print(f"  PHASE 3A: BENCHMARK EVALUATION (FROZEN LINEAR PROBE - {len(test_labels)} IMAGES)")
+    print("=" * 70)
     
     linear_head.eval()
     with torch.no_grad():
@@ -310,22 +332,24 @@ def evaluate_model(linear_head, test_feats, test_labels, class_names):
     print(classification_report(targets, preds, target_names=class_names, digits=4, zero_division=0))
     
     # Save Confusion Matrix Plot
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(12, 10))
     plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
     plt.title("Quadtree-JEPA Frozen Linear Probe Confusion Matrix")
     plt.colorbar()
     tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, class_names, rotation=25, ha="right")
-    plt.yticks(tick_marks, class_names)
+    plt.xticks(tick_marks, class_names, rotation=35, ha="right", fontsize=8)
+    plt.yticks(tick_marks, class_names, fontsize=8)
     
     thresh = cm.max() / 2.
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            plt.text(j, i, format(cm[i, j], 'd'),
-                     horizontalalignment="center",
-                     color="white" if cm[i, j] > thresh else "black",
-                     fontsize=14, fontweight="bold")
-                     
+            val = cm[i, j]
+            if val > 0:
+                plt.text(j, i, format(val, 'd'),
+                         horizontalalignment="center",
+                         color="white" if val > thresh else "black",
+                         fontsize=7, fontweight="bold")
+                         
     plt.ylabel('Ground Truth')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
@@ -336,9 +360,9 @@ def evaluate_model(linear_head, test_feats, test_labels, class_names):
     return acc, f1
 
 def evaluate_finetuned_model(classifier, test_dataset, class_names):
-    print("\n" + "=" * 65)
-    print("  PHASE 3B: BENCHMARK EVALUATION (FINE-TUNED CLASSIFIER - 60 IMAGES)")
-    print("=" * 65)
+    print("\n" + "=" * 70)
+    print(f"  PHASE 3B: BENCHMARK EVALUATION (FINE-TUNED CLASSIFIER - {len(test_dataset)} IMAGES)")
+    print("=" * 70)
     
     classifier.eval()
     all_preds = []
@@ -347,8 +371,9 @@ def evaluate_finetuned_model(classifier, test_dataset, class_names):
     with torch.no_grad():
         for i in range(len(test_dataset)):
             img, label = test_dataset[i]
-            img = img.to(device)
-            logits = classifier(img)
+            img = img.to(device, non_blocking=True)
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                logits = classifier(img)
             pred = torch.argmax(logits, dim=-1).item()
             all_preds.append(pred)
             all_targets.append(label)
@@ -370,22 +395,24 @@ def evaluate_finetuned_model(classifier, test_dataset, class_names):
     print("\nDetailed Per-Class Classification Report (Fine-Tuned):")
     print(classification_report(targets, preds, target_names=class_names, digits=4, zero_division=0))
     
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(12, 10))
     plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Greens)
     plt.title("Quadtree-JEPA Fine-Tuned Confusion Matrix")
     plt.colorbar()
     tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, class_names, rotation=25, ha="right")
-    plt.yticks(tick_marks, class_names)
+    plt.xticks(tick_marks, class_names, rotation=35, ha="right", fontsize=8)
+    plt.yticks(tick_marks, class_names, fontsize=8)
     
     thresh = cm.max() / 2.
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            plt.text(j, i, format(cm[i, j], 'd'),
-                     horizontalalignment="center",
-                     color="white" if cm[i, j] > thresh else "black",
-                     fontsize=14, fontweight="bold")
-                     
+            val = cm[i, j]
+            if val > 0:
+                plt.text(j, i, format(val, 'd'),
+                         horizontalalignment="center",
+                         color="white" if val > thresh else "black",
+                         fontsize=7, fontweight="bold")
+                         
     plt.ylabel('Ground Truth')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
@@ -404,11 +431,18 @@ def main():
     # 1. Load Data
     train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE)
     test_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "test"), target_size=TARGET_SIZE)
+    num_classes = len(train_dataset.classes)
     
-    print(f"Classes ({len(train_dataset.classes)}): {train_dataset.classes}")
-    print(f"Training samples: {len(train_dataset)} | Testing samples: {len(test_dataset)}\n")
+    print(f"Classes ({num_classes}): {train_dataset.classes}")
+    print(f"Training samples: {len(train_dataset):,} | Testing samples: {len(test_dataset):,}\n")
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=NUM_WORKERS, 
+        pin_memory=torch.cuda.is_available()
+    )
     
     # 2. Build Model
     base_vit = ViT(
@@ -432,17 +466,17 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=PRETRAIN_EPOCHS, eta_min=1e-6)
     monitor = TrainingMonitor()
     
-    # 3. Phase 1: Pre-training (75 Epochs)
+    # 3. Phase 1: Pre-training (15 Epochs)
     run_pretraining(model, train_loader, optimizer, scheduler, monitor)
     
     # 4. Phase 2A: Feature Extraction & Linear Probe Training (Frozen Backbone)
     train_feats, train_labels = extract_dataset_embeddings(model, train_dataset)
     test_feats, test_labels = extract_dataset_embeddings(model, test_dataset)
     
-    linear_head = train_linear_probe(train_feats, train_labels, num_classes=len(train_dataset.classes), epochs=PROBE_EPOCHS)
+    linear_head = train_linear_probe(train_feats, train_labels, num_classes=num_classes, epochs=PROBE_EPOCHS)
     
     # 5. Phase 2B: End-to-End Discriminative Fine-Tuning (Unfrozen Backbone)
-    ft_classifier = train_finetuned_classifier(model, train_dataset, num_classes=len(train_dataset.classes), epochs=FINETUNE_EPOCHS)
+    ft_classifier = train_finetuned_classifier(model, train_dataset, num_classes=num_classes, epochs=FINETUNE_EPOCHS)
     
     # 6. Phase 3: Benchmark Evaluations & Comparison
     evaluate_model(linear_head, test_feats, test_labels, train_dataset.classes)
