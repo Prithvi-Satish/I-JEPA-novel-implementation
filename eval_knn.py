@@ -1,6 +1,8 @@
 import os
 import torch
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report

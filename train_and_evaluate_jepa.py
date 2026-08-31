@@ -9,6 +9,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from PIL import Image
 import torchvision.transforms as T
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
 
