@@ -1,4 +1,4 @@
-# QuadTree-JEPA Project: Modifications & Roadmap (`mods.md`)
+# QuadTree-JEPA Project: Modifications & Roadmap (`modifications.md`)
 
 This living document tracks planned, in-progress, and completed modifications for the QuadTree-JEPA framework and benchmark pipeline.
 

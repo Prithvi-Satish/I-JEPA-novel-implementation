@@ -18,9 +18,9 @@ from quadtree_jepa import QuadtreeJEPA, QuadtreeClassifier
 # ==========================================
 # HYPERPARAMETERS & CONFIGURATION
 # ==========================================
-PRETRAIN_EPOCHS = 15
-PROBE_EPOCHS = 20
-FINETUNE_EPOCHS = 15
+PRETRAIN_EPOCHS = 30
+PROBE_EPOCHS = 30
+FINETUNE_EPOCHS = 20
 BATCH_SIZE = 1  # Dynamic quadtree sequence lengths processed per image
 GRAD_ACCUM_STEPS = 16
 LEARNING_RATE = 1e-4
@@ -43,9 +43,10 @@ use_amp = torch.cuda.is_available()
 # DATASET DEFINITION
 # ==========================================
 class LabeledPlantDataset(Dataset):
-    def __init__(self, root_dir, target_size=504):
+    def __init__(self, root_dir, target_size=504, is_train=True):
         self.root_dir = root_dir
         self.target_size = target_size
+        self.is_train = is_train
         self.classes = sorted([d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))])
         self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
         
@@ -57,11 +58,22 @@ class LabeledPlantDataset(Dataset):
                 if any(fname.endswith(ext) for ext in valid_exts):
                     self.samples.append((os.path.join(cls_dir, fname), self.class_to_idx[cls_name]))
                     
-        self.transform = T.Compose([
-            T.Resize((self.target_size, self.target_size)),
-            T.ToTensor(),
-            T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        if is_train:
+            self.transform = T.Compose([
+                T.Resize((self.target_size, self.target_size)),
+                T.RandomHorizontalFlip(p=0.5),
+                T.RandomVerticalFlip(p=0.5),
+                T.RandomRotation(degrees=20),
+                T.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            self.transform = T.Compose([
+                T.Resize((self.target_size, self.target_size)),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
 
     def __len__(self):
         return len(self.samples)
@@ -102,6 +114,7 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
     print("=" * 70)
     print(f"  PHASE 1: SELF-SUPERVISED QUADTREE-JEPA PRE-TRAINING ({PRETRAIN_EPOCHS} EPOCHS)")
     print(f"  Acceleration: Mixed Precision (AMP FP16: {use_amp}) | Workers: {NUM_WORKERS}")
+    print("  Loss Regularization: Variance (VICReg) + Covariance Decorrelation (Orthogonal Dimensions)")
     print("=" * 70)
     
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -149,16 +162,25 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
                 accum_preds.append(pred_active)
                 accum_align_losses.append(align_loss)
             
-            # Batch-level variance regularization across accumulated gradient steps
+            # Batch-level variance + covariance decorrelation regularization across accumulated steps
             if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
                 if len(accum_preds) > 0:
                     with torch.amp.autocast('cuda', enabled=use_amp):
                         all_pred_tokens = torch.cat(accum_preds, dim=0)
-                        pred_std = torch.sqrt(all_pred_tokens.var(dim=0) + 1e-04)
+                        
+                        # 1. Variance Regularization (Forces dimension std >= 1.0)
+                        pred_centered = all_pred_tokens - all_pred_tokens.mean(dim=0, keepdim=True)
+                        pred_std = torch.sqrt(pred_centered.var(dim=0) + 1e-04)
                         variance_loss = torch.mean(F.relu(1.0 - pred_std))
                         
+                        # 2. Covariance Decorrelation Loss (Forces dimensions to be orthogonal/uncorrelated)
+                        N = all_pred_tokens.size(0)
+                        cov_matrix = (pred_centered.T @ pred_centered) / (N - 1)
+                        off_diagonal = cov_matrix - torch.diag(torch.diagonal(cov_matrix))
+                        cov_loss = (off_diagonal ** 2).sum() / EMBED_DIM
+                        
                         mean_align_loss = torch.stack(accum_align_losses).mean()
-                        total_loss = (mean_align_loss * 10.0) + variance_loss
+                        total_loss = (mean_align_loss * 10.0) + variance_loss + (cov_loss * 0.04)
                     
                     scaler.scale(total_loss).backward()
                     scaler.unscale_(optimizer)
@@ -198,7 +220,7 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
     total_time = (time.time() - start_time) / 60
     print(f"\n Pre-training completed in {total_time:.2f} minutes.")
     
-    final_path = os.path.join(CHECKPOINT_DIR, "jepa_plant_15epochs.pt")
+    final_path = os.path.join(CHECKPOINT_DIR, f"jepa_plant_{PRETRAIN_EPOCHS}epochs.pt")
     torch.save(model.state_dict(), final_path)
     print(f" Final checkpoint saved to: {final_path}\n")
 
@@ -429,8 +451,9 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     
     # 1. Load Data
-    train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE)
-    test_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "test"), target_size=TARGET_SIZE)
+    train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=True)
+    eval_train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=False)
+    test_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "test"), target_size=TARGET_SIZE, is_train=False)
     num_classes = len(train_dataset.classes)
     
     print(f"Classes ({num_classes}): {train_dataset.classes}")
@@ -470,7 +493,7 @@ def main():
     run_pretraining(model, train_loader, optimizer, scheduler, monitor)
     
     # 4. Phase 2A: Feature Extraction & Linear Probe Training (Frozen Backbone)
-    train_feats, train_labels = extract_dataset_embeddings(model, train_dataset)
+    train_feats, train_labels = extract_dataset_embeddings(model, eval_train_dataset)
     test_feats, test_labels = extract_dataset_embeddings(model, test_dataset)
     
     linear_head = train_linear_probe(train_feats, train_labels, num_classes=num_classes, epochs=PROBE_EPOCHS)

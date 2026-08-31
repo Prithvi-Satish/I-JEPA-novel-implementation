@@ -114,10 +114,11 @@ class ZAxisFusionBridge(nn.Module):
         
         return projected + pe_2d + pe_1d
 
-class CrossAttentionPredictor(nn.Module):
-    def __init__(self, embed_dim=768, heads=8):
+class PredictorBlock(nn.Module):
+    def __init__(self, embed_dim=768, heads=8, is_cross=False):
         super().__init__()
-        self.cross_attn = nn.MultiheadAttention(embed_dim, heads, batch_first=True)
+        self.is_cross = is_cross
+        self.attn = nn.MultiheadAttention(embed_dim, heads, batch_first=True)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
@@ -126,21 +127,38 @@ class CrossAttentionPredictor(nn.Module):
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
 
-    def forward(self, context_tokens, target_queries, context_mask=None, target_mask=None):
-        attn_out, _ = self.cross_attn(
-            query=target_queries, 
-            key=context_tokens, 
-            value=context_tokens,
-            key_padding_mask=context_mask
-        )
-        x = self.norm1(target_queries + attn_out)
+    def forward(self, x, context=None, context_mask=None):
+        if self.is_cross and context is not None:
+            attn_out, _ = self.attn(query=x, key=context, value=context, key_padding_mask=context_mask)
+        else:
+            attn_out, _ = self.attn(query=x, key=x, value=x)
+        x = self.norm1(x + attn_out)
         x = self.norm2(x + self.mlp(x))
+        return x
+
+class CrossAttentionPredictor(nn.Module):
+    def __init__(self, embed_dim=768, depth=3, heads=8):
+        super().__init__()
+        self.depth = depth
+        self.layers = nn.ModuleList([
+            PredictorBlock(embed_dim=embed_dim, heads=heads, is_cross=(i == 0))
+            for i in range(depth)
+        ])
+        self.final_norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, context_tokens, target_queries, context_mask=None, target_mask=None):
+        # Layer 1: Cross-Attention (Target queries gather information from context)
+        x = self.layers[0](target_queries, context=context_tokens, context_mask=context_mask)
+        # Layers 2..depth: Self-Attention (Target tokens refine spatial predictions among themselves)
+        for layer in self.layers[1:]:
+            x = layer(x)
+        x = self.final_norm(x)
         if target_mask is not None:
             x = x * (~target_mask.unsqueeze(-1))
         return x
 
 class QuadtreeJEPA(nn.Module):
-    def __init__(self, base_vit, embed_dim=768, max_seq_len=800):
+    def __init__(self, base_vit, embed_dim=768, max_seq_len=800, predictor_depth=3):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.tokenizer = QuadtreeTokenizer(thresholds=[0.28, 0.18, 0.11, 0.0])
@@ -152,7 +170,7 @@ class QuadtreeJEPA(nn.Module):
         for param in self.target_encoder.parameters():
             param.requires_grad = False
             
-        self.predictor = CrossAttentionPredictor(embed_dim=embed_dim)
+        self.predictor = CrossAttentionPredictor(embed_dim=embed_dim, depth=predictor_depth)
 
     def update_target_encoder(self, momentum=0.996):
         with torch.no_grad():

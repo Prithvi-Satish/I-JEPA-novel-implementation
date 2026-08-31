@@ -99,9 +99,9 @@ def run_all_checks():
     print("  QuadtreeClassifier & discriminative optimizer verified.\n")
     
     # -------------------------------------------------------------
-    # Check 6: Mixed Precision (AMP) & Batch Variance Regularization (MOD-04)
+    # Check 6: Mixed Precision (AMP), Batch Variance & Covariance Decorrelation (MOD-04)
     # -------------------------------------------------------------
-    print("[Check 6/6] Verifying Mixed Precision (AMP) & Batch Variance Regularization (MOD-04)...")
+    print("[Check 6/6] Verifying Mixed Precision (AMP), Variance & Covariance Decorrelation (MOD-04)...")
     scaler = torch.amp.GradScaler('cuda', enabled=torch.cuda.is_available())
     accum_preds = []
     
@@ -111,15 +111,22 @@ def run_all_checks():
             accum_preds.append(p_out[0, :t_l, :])
             
     all_tokens = torch.cat(accum_preds, dim=0)
-    pred_std = torch.sqrt(all_tokens.var(dim=0) + 1e-04)
+    pred_centered = all_tokens - all_tokens.mean(dim=0, keepdim=True)
+    pred_std = torch.sqrt(pred_centered.var(dim=0) + 1e-04)
     var_loss = torch.mean(F.relu(1.0 - pred_std))
     
-    scaler.scale(var_loss).backward()
+    N = all_tokens.size(0)
+    cov_matrix = (pred_centered.T @ pred_centered) / (N - 1)
+    off_diagonal = cov_matrix - torch.diag(torch.diagonal(cov_matrix))
+    cov_loss = (off_diagonal ** 2).sum() / 768
+    total_reg_loss = var_loss + (cov_loss * 0.04)
+    
+    scaler.scale(total_reg_loss).backward()
     scaler.step(optimizer)
     scaler.update()
     
-    print(f"  -> Batch-level token pool: {all_tokens.shape} | Variance loss: {var_loss.item():.5f}")
-    print("  AMP Mixed Precision & Batch Variance Regularization verified.\n")
+    print(f"  -> Batch token pool: {all_tokens.shape} | Variance Loss: {var_loss.item():.5f} | Covariance Loss: {cov_loss.item():.5f}")
+    print("  AMP Mixed Precision, Variance & Covariance Decorrelation verified.\n")
     
     print("=" * 70)
     print(" [*] ALL 6/6 VERIFICATION CHECKS PASSED WITH ZERO ERRORS!")
