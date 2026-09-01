@@ -246,10 +246,21 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
 # ==========================================
 # PHASE 2A: LINEAR PROBING & FEATURE EXTRACTION
 # ==========================================
-def extract_dataset_embeddings(model, dataset):
+def extract_dataset_embeddings(model, dataset, cache_name=None):
+    if cache_name:
+        cache_path = os.path.join(CHECKPOINT_DIR, f"{cache_name}.pt")
+        if os.path.exists(cache_path):
+            print(f"[*] Found cached embeddings: {cache_path}. Loading in 0.1s...")
+            try:
+                cached = torch.load(cache_path, map_location='cpu', weights_only=False)
+                return cached['feats'], cached['labels']
+            except Exception as e:
+                print(f"[*] Cache corrupted ({e}), re-extracting...")
+                
     embeddings = []
     labels = []
     print(f"Extracting frozen latent features for {len(dataset)} images (Multi-Scale)...")
+    start_t = time.time()
     with torch.no_grad():
         for i in range(len(dataset)):
             img, label = dataset[i]
@@ -259,8 +270,20 @@ def extract_dataset_embeddings(model, dataset):
             embeddings.append(feat.float().cpu().squeeze(0))
             labels.append(label)
             if (i + 1) % 1000 == 0 or (i + 1) == len(dataset):
-                print(f"  -> Extracted {i+1}/{len(dataset)} features...")
-    return torch.stack(embeddings), torch.tensor(labels)
+                elapsed = time.time() - start_t
+                speed = (i + 1) / max(elapsed, 0.001)
+                eta = (len(dataset) - (i + 1)) / max(speed, 0.001)
+                print(f"  -> Extracted {i+1:>5}/{len(dataset)} features ({((i+1)/len(dataset))*100:.1f}%) | Speed: {speed:.1f} img/s | ETA: {eta/60:.1f}m", flush=True)
+                
+    feats_tensor = torch.stack(embeddings)
+    labels_tensor = torch.tensor(labels)
+    
+    if cache_name:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        torch.save({'feats': feats_tensor, 'labels': labels_tensor}, cache_path)
+        print(f"[*] Feature embeddings successfully cached to: {cache_path}\n", flush=True)
+        
+    return feats_tensor, labels_tensor
 
 def train_linear_probe(train_feats, train_labels, num_classes=18, epochs=PROBE_EPOCHS):
     print("=" * 70)
@@ -287,7 +310,7 @@ def train_linear_probe(train_feats, train_labels, num_classes=18, epochs=PROBE_E
             running_loss += loss.item()
             
         if epoch % 5 == 0 or epoch == epochs:
-            print(f"Probe Epoch [{epoch:02d}/{epochs}] | Cross-Entropy Loss: {running_loss/len(loader):.4f}")
+            print(f"Probe Epoch [{epoch:02d}/{epochs}] | Cross-Entropy Loss: {running_loss/len(loader):.4f}", flush=True)
             
     return linear_head
 
@@ -315,6 +338,7 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, e
     loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
     
     for epoch in range(1, epochs + 1):
+        epoch_start = time.time()
         classifier.train()
         running_loss = 0.0
         optimizer.zero_grad()
@@ -338,8 +362,8 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, e
                 optimizer.zero_grad()
                 
         scheduler.step()
-        if epoch % 5 == 0 or epoch == epochs:
-            print(f"Fine-Tune Epoch [{epoch:02d}/{epochs}] | Cross-Entropy Loss: {running_loss/len(loader):.4f} | Head LR: {optimizer.param_groups[2]['lr']:.2e} | Backbone LR: {optimizer.param_groups[0]['lr']:.2e}")
+        epoch_duration = time.time() - epoch_start
+        print(f"Fine-Tune Epoch [{epoch:02d}/{epochs}] ({epoch_duration/60:.1f}m) | Loss: {running_loss/len(loader):.4f} | Head LR: {optimizer.param_groups[2]['lr']:.2e} | Backbone LR: {optimizer.param_groups[0]['lr']:.2e}", flush=True)
             
     return classifier
 
@@ -536,16 +560,19 @@ def main():
         run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=args.resume, total_epochs=args.pretrain_epochs)
     
     # 4. Phase 2A: Feature Extraction & Linear Probe Training (Frozen Backbone)
-    train_feats, train_labels = extract_dataset_embeddings(model, eval_train_dataset)
-    test_feats, test_labels = extract_dataset_embeddings(model, test_dataset)
+    train_feats, train_labels = extract_dataset_embeddings(model, eval_train_dataset, cache_name="train_embeddings_cache")
+    test_feats, test_labels = extract_dataset_embeddings(model, test_dataset, cache_name="test_embeddings_cache")
     
     linear_head = train_linear_probe(train_feats, train_labels, num_classes=num_classes, epochs=args.probe_epochs)
     
-    # 5. Phase 2B: End-to-End Discriminative Fine-Tuning (Unfrozen Backbone)
+    # 5. Phase 3A: Immediate Frozen Linear Probe Benchmark Evaluation
+    print("\n[*] Immediate Evaluation: Computing Frozen Linear Probe Benchmark Scores...")
+    evaluate_model(linear_head, test_feats, test_labels, train_dataset.classes)
+    
+    # 6. Phase 2B: End-to-End Discriminative Fine-Tuning (Unfrozen Backbone)
     ft_classifier = train_finetuned_classifier(model, train_dataset, num_classes=num_classes, epochs=args.finetune_epochs)
     
-    # 6. Phase 3: Benchmark Evaluations & Comparison
-    evaluate_model(linear_head, test_feats, test_labels, train_dataset.classes)
+    # 7. Phase 3B: Fine-Tuned Benchmark Evaluation
     evaluate_finetuned_model(ft_classifier, test_dataset, train_dataset.classes)
 
 if __name__ == "__main__":
