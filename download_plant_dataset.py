@@ -92,6 +92,17 @@ def prepare_dataset():
     random.seed(42)
     os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
     
+    # Fast check: If already downloaded, skip immediately
+    train_dir = os.path.join(BASE_OUTPUT_DIR, "train")
+    test_dir = os.path.join(BASE_OUTPUT_DIR, "test")
+    if os.path.exists(train_dir) and os.path.exists(test_dir):
+        import glob
+        train_count = len(glob.glob(os.path.join(train_dir, "*", "*.*")))
+        test_count = len(glob.glob(os.path.join(test_dir, "*", "*.*")))
+        if train_count >= 18000 and test_count >= 4000:
+            print(f"[*] Dataset already fully downloaded ({train_count:,} train, {test_count:,} test images). Skipping download!\n")
+            return
+
     print("=" * 70)
     print("   PLANTVILLAGE DATASET DOWNLOADER: TOMATO, APPLE, CORN (25,183 IMAGES)  ")
     print("=" * 70)
