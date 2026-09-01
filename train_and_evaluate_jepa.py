@@ -1,6 +1,8 @@
 import os
+import sys
 import time
 import glob
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -112,9 +114,21 @@ class TrainingMonitor:
 # ==========================================
 # PHASE 1: SELF-SUPERVISED PRE-TRAINING (HIGH PERFORMANCE + AMP)
 # ==========================================
-def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
+def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=None, total_epochs=PRETRAIN_EPOCHS):
+    start_epoch = 1
+    if resume_path and os.path.exists(resume_path):
+        print(f"\n[*] Resuming QuadTree-JEPA pre-training from: {resume_path}")
+        model.load_state_dict(torch.load(resume_path, map_location=device))
+        base_name = os.path.basename(resume_path)
+        digits = ''.join(filter(str.isdigit, base_name))
+        if digits:
+            start_epoch = int(digits) + 1
+        print(f"[*] Resuming from Epoch {start_epoch:02d} up to {total_epochs:02d}...\n")
+        for _ in range(1, start_epoch):
+            scheduler.step()
+
     print("=" * 70)
-    print(f"  PHASE 1: SELF-SUPERVISED QUADTREE-JEPA PRE-TRAINING ({PRETRAIN_EPOCHS} EPOCHS)")
+    print(f"  PHASE 1: SELF-SUPERVISED QUADTREE-JEPA PRE-TRAINING ({total_epochs} EPOCHS)")
     print(f"  Acceleration: Mixed Precision (AMP FP16: {use_amp}) | Workers: {NUM_WORKERS}")
     print("  Loss Regularization: Variance (VICReg) + Covariance Decorrelation (Orthogonal Dimensions)")
     print("=" * 70)
@@ -122,7 +136,7 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     start_time = time.time()
     
-    for epoch in range(1, PRETRAIN_EPOCHS + 1):
+    for epoch in range(start_epoch, total_epochs + 1):
         model.train()
         model.target_encoder.eval()
         
@@ -130,7 +144,7 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor):
         running_loss = 0.0
         valid_steps = 0
         
-        alpha = EMA_MOMENTUM_START + (EMA_MOMENTUM_END - EMA_MOMENTUM_START) * (epoch / PRETRAIN_EPOCHS)
+        alpha = EMA_MOMENTUM_START + (EMA_MOMENTUM_END - EMA_MOMENTUM_START) * (epoch / total_epochs)
         
         last_valid_pred = None
         last_valid_true = None
@@ -445,14 +459,24 @@ def evaluate_finetuned_model(classifier, test_dataset, class_names):
     plt.close()
     print(f" Fine-tuned confusion matrix plot saved to: {os.path.abspath(plot_path)}")
     return acc, f1
-
 # ==========================================
 # MAIN EXECUTION FLOW
 # ==========================================
 def main():
-    print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    parser = argparse.ArgumentParser(description="QuadTree-JEPA Training and Dual Evaluation Pipeline")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from")
+    parser.add_argument("--eval_only", action="store_true", help="Skip pretraining and run linear probe + fine-tuning directly")
+    parser.add_argument("--pretrain_epochs", type=int, default=PRETRAIN_EPOCHS, help="Total pretrain epochs")
+    parser.add_argument("--probe_epochs", type=int, default=PROBE_EPOCHS, help="Probe epochs")
+    parser.add_argument("--finetune_epochs", type=int, default=FINETUNE_EPOCHS, help="Fine-tuning epochs")
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print("  QUADTREE-JEPA END-TO-END BENCHMARK PIPELINE")
+    print(f"  Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print("=" * 70)
     
-    # 1. Load Data
+    # 1. Prepare Datasets & Loaders
     train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=True)
     eval_train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=False)
     test_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "test"), target_size=TARGET_SIZE, is_train=False)
@@ -488,20 +512,31 @@ def main():
         {"params": model.z_bridge.parameters()}
     ]
     optimizer = torch.optim.AdamW(param_groups, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=PRETRAIN_EPOCHS, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.pretrain_epochs, eta_min=1e-6)
     monitor = TrainingMonitor()
     
-    # 3. Phase 1: Pre-training (15 Epochs)
-    run_pretraining(model, train_loader, optimizer, scheduler, monitor)
+    # 3. Phase 1: Pre-training (or load checkpoint if --eval_only)
+    if args.eval_only:
+        ckpt = args.resume or os.path.join(CHECKPOINT_DIR, "jepa_plant_latest.pt")
+        if not os.path.exists(ckpt) and os.path.exists(os.path.join(CHECKPOINT_DIR, "jepa_plant_epoch15.pt")):
+            ckpt = os.path.join(CHECKPOINT_DIR, "jepa_plant_epoch15.pt")
+        print(f"\n[*] --eval_only mode active. Loading checkpoint: {ckpt}")
+        if os.path.exists(ckpt):
+            model.load_state_dict(torch.load(ckpt, map_location=device))
+            print(f"[*] Successfully loaded weights from {ckpt}\n")
+        else:
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+    else:
+        run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=args.resume, total_epochs=args.pretrain_epochs)
     
     # 4. Phase 2A: Feature Extraction & Linear Probe Training (Frozen Backbone)
     train_feats, train_labels = extract_dataset_embeddings(model, eval_train_dataset)
     test_feats, test_labels = extract_dataset_embeddings(model, test_dataset)
     
-    linear_head = train_linear_probe(train_feats, train_labels, num_classes=num_classes, epochs=PROBE_EPOCHS)
+    linear_head = train_linear_probe(train_feats, train_labels, num_classes=num_classes, epochs=args.probe_epochs)
     
     # 5. Phase 2B: End-to-End Discriminative Fine-Tuning (Unfrozen Backbone)
-    ft_classifier = train_finetuned_classifier(model, train_dataset, num_classes=num_classes, epochs=FINETUNE_EPOCHS)
+    ft_classifier = train_finetuned_classifier(model, train_dataset, num_classes=num_classes, epochs=args.finetune_epochs)
     
     # 6. Phase 3: Benchmark Evaluations & Comparison
     evaluate_model(linear_head, test_feats, test_labels, train_dataset.classes)
