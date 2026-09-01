@@ -118,7 +118,10 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
     start_epoch = 1
     if resume_path and os.path.exists(resume_path):
         print(f"\n[*] Resuming QuadTree-JEPA pre-training from: {resume_path}")
-        model.load_state_dict(torch.load(resume_path, map_location=device))
+        try:
+            model.load_state_dict(torch.load(resume_path, map_location=device, weights_only=False))
+        except TypeError:
+            model.load_state_dict(torch.load(resume_path, map_location=device))
         base_name = os.path.basename(resume_path)
         digits = ''.join(filter(str.isdigit, base_name))
         if digits:
@@ -522,7 +525,10 @@ def main():
             ckpt = os.path.join(CHECKPOINT_DIR, "jepa_plant_epoch15.pt")
         print(f"\n[*] --eval_only mode active. Loading checkpoint: {ckpt}")
         if os.path.exists(ckpt):
-            model.load_state_dict(torch.load(ckpt, map_location=device))
+            try:
+                model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=False))
+            except TypeError:
+                model.load_state_dict(torch.load(ckpt, map_location=device))
             print(f"[*] Successfully loaded weights from {ckpt}\n")
         else:
             raise FileNotFoundError(f"Checkpoint not found: {ckpt}")

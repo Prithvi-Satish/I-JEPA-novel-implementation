@@ -46,7 +46,10 @@ def evaluate_knn():
     ).to(device)
 
     model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM, max_seq_len=MAX_SEQ_LEN).to(device)
-    model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+    try:
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False))
+    except TypeError:
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.eval()
     print("Pretrained JEPA backbone successfully loaded.\n")
 
