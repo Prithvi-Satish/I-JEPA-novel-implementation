@@ -16,7 +16,7 @@ def run_dry_run():
     pipeline.main()
     
     print("\n[Check 2/4] Verifying checkpoint was created...")
-    assert os.path.exists("./checkpoints/jepa_plant_75epochs.pt"), "Checkpoint missing!"
+    assert os.path.exists("./checkpoints/jepa_plant_latest.pt") or os.path.exists("./checkpoints/jepa_plant_2epochs.pt"), "Checkpoint missing!"
     print(" Checkpoint verified.")
     
     print("\n[Check 3/4] Verifying confusion matrix image was created...")

@@ -17,10 +17,10 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
 
 from vit_pytorch.vit import ViT
-from quadtree_jepa import QuadtreeJEPA, QuadtreeClassifier
+from quadtree_jepa import QuadtreeJEPA, QuadtreeClassifier, ScaleAwareAttentivePool
 
 # ==========================================
-# HYPERPARAMETERS & CONFIGURATION
+# HYPERPARAMETERS & CONFIGURATION (V2)
 # ==========================================
 PRETRAIN_EPOCHS = 30
 PROBE_EPOCHS = 30
@@ -33,8 +33,9 @@ EMA_MOMENTUM_START = 0.996
 EMA_MOMENTUM_END = 0.9999
 EMBED_DIM = 768
 MAX_SEQ_LEN = 800
+TARGET_BUDGET = 256
 TARGET_SIZE = 504
-NUM_WORKERS = 4
+NUM_WORKERS = 0 if os.name == 'nt' else 4
 CHECKPOINT_INTERVAL = 5  # Save checkpoint every 5 epochs
 CHECKPOINT_DIR = "./checkpoints"
 DATA_DIR = "./data/plant_dataset"
@@ -89,6 +90,47 @@ class LabeledPlantDataset(Dataset):
             tensor = self.transform(rgb)
         return tensor, label
 
+def compute_class_weights(dataset, num_classes=18):
+    """
+    Computes inverse class frequency weights to counteract dataset imbalance across 18 classes.
+    """
+    labels = [s[1] for s in dataset.samples]
+    counts = torch.bincount(torch.tensor(labels), minlength=num_classes)
+    weights = 1.0 / (counts.float() + 1e-5)
+    weights = (weights / weights.sum()) * num_classes
+    return weights.to(device)
+
+def apply_mixup_or_cutmix(img1, label1, img2, label2, alpha_mixup=0.8, alpha_cutmix=1.0, prob_cutmix=0.5):
+    """
+    V2-10: MixUp / CutMix data augmentation for fine-grained leaf pathology.
+    Blends two leaf images and creates soft target labels.
+    """
+    use_cutmix = (torch.rand(1).item() < prob_cutmix)
+    
+    if use_cutmix:
+        lam = np.random.beta(alpha_cutmix, alpha_cutmix)
+        _, H, W = img1.shape
+        cut_rat = np.sqrt(1.0 - lam)
+        cut_w = int(W * cut_rat)
+        cut_h = int(H * cut_rat)
+        
+        cx = np.random.randint(W)
+        cy = np.random.randint(H)
+        
+        bbx1 = np.clip(cx - cut_w // 2, 0, W)
+        bby1 = np.clip(cy - cut_h // 2, 0, H)
+        bbx2 = np.clip(cx + cut_w // 2, 0, W)
+        bby2 = np.clip(cy + cut_h // 2, 0, H)
+        
+        mixed_img = img1.clone()
+        mixed_img[:, bby1:bby2, bbx1:bbx2] = img2[:, bby1:bby2, bbx1:bbx2]
+        lam = 1.0 - ((bbx2 - bbx1) * (bby2 - bby1) / (H * W))
+    else:
+        lam = np.random.beta(alpha_mixup, alpha_mixup)
+        mixed_img = lam * img1 + (1.0 - lam) * img2
+        
+    return mixed_img, label1, label2, lam
+
 # ==========================================
 # LATENT HEALTH MONITOR
 # ==========================================
@@ -112,7 +154,7 @@ class TrainingMonitor:
         return std_dev, cos_sim
 
 # ==========================================
-# PHASE 1: SELF-SUPERVISED PRE-TRAINING (HIGH PERFORMANCE + AMP)
+# PHASE 1: SELF-SUPERVISED PRE-TRAINING (V2 HYBRID ACCELERATION)
 # ==========================================
 def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=None, total_epochs=PRETRAIN_EPOCHS):
     start_epoch = 1
@@ -132,8 +174,8 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
 
     print("=" * 70)
     print(f"  PHASE 1: SELF-SUPERVISED QUADTREE-JEPA PRE-TRAINING ({total_epochs} EPOCHS)")
+    print(f"  V2: Hybrid Image-Relative Variance + Quantile Budget Top-K Allocation")
     print(f"  Acceleration: Mixed Precision (AMP FP16: {use_amp}) | Workers: {NUM_WORKERS}")
-    print("  Loss Regularization: Variance (VICReg) + Covariance Decorrelation (Orthogonal Dimensions)")
     print("=" * 70)
     
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -181,7 +223,7 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
                 accum_preds.append(pred_active)
                 accum_align_losses.append(align_loss)
             
-            # Batch-level variance + covariance decorrelation regularization across accumulated steps
+            # Batch-level variance + regularized covariance decorrelation
             if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
                 if len(accum_preds) > 0:
                     with torch.amp.autocast('cuda', enabled=use_amp):
@@ -192,14 +234,19 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
                         pred_std = torch.sqrt(pred_centered.var(dim=0) + 1e-04)
                         variance_loss = torch.mean(F.relu(1.0 - pred_std))
                         
-                        # 2. Covariance Decorrelation Loss (Forces dimensions to be orthogonal/uncorrelated)
+                        # 2. Regularized Covariance Decorrelation Loss with trace scaling
                         N = all_pred_tokens.size(0)
-                        cov_matrix = (pred_centered.T @ pred_centered) / (N - 1)
-                        off_diagonal = cov_matrix - torch.diag(torch.diagonal(cov_matrix))
-                        cov_loss = (off_diagonal ** 2).sum() / EMBED_DIM
+                        if N > 1:
+                            cov_matrix = (pred_centered.T @ pred_centered) / (N - 1)
+                            trace_val = torch.trace(cov_matrix).clamp(min=1e-5)
+                            cov_normalized = cov_matrix / (trace_val / EMBED_DIM)
+                            off_diagonal = cov_normalized - torch.diag(torch.diagonal(cov_normalized))
+                            cov_loss = (off_diagonal ** 2).sum() / EMBED_DIM
+                        else:
+                            cov_loss = torch.tensor(0.0, device=all_pred_tokens.device)
                         
                         mean_align_loss = torch.stack(accum_align_losses).mean()
-                        total_loss = (mean_align_loss * 10.0) + variance_loss + (cov_loss * 0.04)
+                        total_loss = (mean_align_loss * 10.0) + variance_loss + (cov_loss * 0.02)
                     
                     scaler.scale(total_loss).backward()
                     scaler.unscale_(optimizer)
@@ -225,12 +272,12 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
         avg_loss = running_loss / max(valid_steps, 1)
         if last_valid_pred is not None:
             std_dev, cos_sim = monitor.check(last_valid_pred, last_valid_true, last_valid_t_len, step, epoch)
-            print(f"Epoch [{epoch:02d}/{PRETRAIN_EPOCHS}] ({epoch_duration/60:.1f}m) | Loss: {avg_loss:.5f} | Latent Std: {std_dev:.4f} | CosSim: {cos_sim:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"Epoch [{epoch:02d}/{total_epochs}] ({epoch_duration/60:.1f}m) | Loss: {avg_loss:.5f} | Latent Std: {std_dev:.4f} | CosSim: {cos_sim:.4f} | LR: {scheduler.get_last_lr()[0]:.2e}")
         else:
-            print(f"Epoch [{epoch:02d}/{PRETRAIN_EPOCHS}] ({epoch_duration/60:.1f}m) | Loss: {avg_loss:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+            print(f"Epoch [{epoch:02d}/{total_epochs}] ({epoch_duration/60:.1f}m) | Loss: {avg_loss:.5f} | LR: {scheduler.get_last_lr()[0]:.2e}")
             
         # Periodic checkpoint save
-        if epoch % CHECKPOINT_INTERVAL == 0 or epoch == PRETRAIN_EPOCHS:
+        if epoch % CHECKPOINT_INTERVAL == 0 or epoch == total_epochs:
             ckpt_name = f"jepa_plant_epoch{epoch}.pt"
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, ckpt_name))
             torch.save(model.state_dict(), os.path.join(CHECKPOINT_DIR, "jepa_plant_latest.pt"))
@@ -239,12 +286,12 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
     total_time = (time.time() - start_time) / 60
     print(f"\n Pre-training completed in {total_time:.2f} minutes.")
     
-    final_path = os.path.join(CHECKPOINT_DIR, f"jepa_plant_{PRETRAIN_EPOCHS}epochs.pt")
+    final_path = os.path.join(CHECKPOINT_DIR, f"jepa_plant_{total_epochs}epochs.pt")
     torch.save(model.state_dict(), final_path)
     print(f" Final checkpoint saved to: {final_path}\n")
 
 # ==========================================
-# PHASE 2A: LINEAR PROBING & FEATURE EXTRACTION
+# PHASE 2A: ATTENTIVE FEATURE PROBING (V2)
 # ==========================================
 def extract_dataset_embeddings(model, dataset, cache_name=None):
     if cache_name:
@@ -259,7 +306,7 @@ def extract_dataset_embeddings(model, dataset, cache_name=None):
                 
     embeddings = []
     labels = []
-    print(f"Extracting frozen latent features for {len(dataset)} images (Multi-Scale)...")
+    print(f"Extracting V2 Scale-Aware Latent Features for {len(dataset)} images...")
     start_t = time.time()
     with torch.no_grad():
         for i in range(len(dataset)):
@@ -285,17 +332,25 @@ def extract_dataset_embeddings(model, dataset, cache_name=None):
         
     return feats_tensor, labels_tensor
 
-def train_linear_probe(train_feats, train_labels, num_classes=18, epochs=PROBE_EPOCHS):
+def train_linear_probe(train_feats, train_labels, num_classes=18, epochs=PROBE_EPOCHS, class_weights=None):
     print("=" * 70)
-    print(f"  PHASE 2A: TRAINING LINEAR CLASSIFIER (PROBING FROZEN JEPA FEATURES, {epochs} EPOCHS)")
+    print(f"  PHASE 2A: TRAINING V2 CLASSIFIER PROBE (FROZEN JEPA FEATURES, {epochs} EPOCHS)")
     print("=" * 70)
     
-    linear_head = nn.Linear(EMBED_DIM, num_classes).to(device)
-    probe_optimizer = torch.optim.Adam(linear_head.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
+    linear_head = nn.Sequential(
+        nn.LayerNorm(EMBED_DIM),
+        nn.Linear(EMBED_DIM, 512),
+        nn.GELU(),
+        nn.Dropout(0.2),
+        nn.Linear(512, num_classes)
+    ).to(device)
+    
+    probe_optimizer = torch.optim.AdamW(linear_head.parameters(), lr=1e-3, weight_decay=1e-4)
+    probe_sched = CosineAnnealingLR(probe_optimizer, T_max=epochs, eta_min=1e-6)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     
     dataset = torch.utils.data.TensorDataset(train_feats, train_labels)
-    loader = DataLoader(dataset, batch_size=64, shuffle=True)
+    loader = DataLoader(dataset, batch_size=128, shuffle=True)
     
     for epoch in range(1, epochs + 1):
         linear_head.train()
@@ -309,15 +364,16 @@ def train_linear_probe(train_feats, train_labels, num_classes=18, epochs=PROBE_E
             probe_optimizer.step()
             running_loss += loss.item()
             
+        probe_sched.step()
         if epoch % 5 == 0 or epoch == epochs:
-            print(f"Probe Epoch [{epoch:02d}/{epochs}] | Cross-Entropy Loss: {running_loss/len(loader):.4f}", flush=True)
+            print(f"Probe Epoch [{epoch:02d}/{epochs}] | Loss: {running_loss/len(loader):.4f}", flush=True)
             
     return linear_head
 
 # ==========================================
-# PHASE 2B: END-TO-END DISCRIMINATIVE FINE-TUNING
+# PHASE 2B: END-TO-END DISCRIMINATIVE FINE-TUNING (V2)
 # ==========================================
-def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, epochs=FINETUNE_EPOCHS):
+def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, epochs=FINETUNE_EPOCHS, class_weights=None):
     print("=" * 70)
     print(f"  PHASE 2B: END-TO-END DISCRIMINATIVE FINE-TUNING ({epochs} EPOCHS)")
     print("=" * 70)
@@ -327,12 +383,13 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, e
     param_groups = [
         {"params": classifier.context_encoder.parameters(), "lr": 1e-5, "weight_decay": 0.05},
         {"params": classifier.z_bridge.parameters(), "lr": 1e-5, "weight_decay": 0.05},
+        {"params": classifier.pooler.parameters(), "lr": 1e-4, "weight_decay": 1e-4},
         {"params": classifier.head.parameters(), "lr": 1e-3, "weight_decay": 1e-4}
     ]
     
     optimizer = torch.optim.AdamW(param_groups)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
     
     loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
@@ -363,7 +420,7 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, e
                 
         scheduler.step()
         epoch_duration = time.time() - epoch_start
-        print(f"Fine-Tune Epoch [{epoch:02d}/{epochs}] ({epoch_duration/60:.1f}m) | Loss: {running_loss/len(loader):.4f} | Head LR: {optimizer.param_groups[2]['lr']:.2e} | Backbone LR: {optimizer.param_groups[0]['lr']:.2e}", flush=True)
+        print(f"Fine-Tune Epoch [{epoch:02d}/{epochs}] ({epoch_duration/60:.1f}m) | Loss: {running_loss/len(loader):.4f} | Head LR: {optimizer.param_groups[3]['lr']:.2e} | Backbone LR: {optimizer.param_groups[0]['lr']:.2e}", flush=True)
             
     return classifier
 
@@ -372,7 +429,7 @@ def train_finetuned_classifier(base_jepa_model, train_dataset, num_classes=18, e
 # ==========================================
 def evaluate_model(linear_head, test_feats, test_labels, class_names):
     print("\n" + "=" * 70)
-    print(f"  PHASE 3A: BENCHMARK EVALUATION (FROZEN LINEAR PROBE - {len(test_labels)} IMAGES)")
+    print(f"  PHASE 3A: BENCHMARK EVALUATION (FROZEN PROBE - {len(test_labels)} IMAGES)")
     print("=" * 70)
     
     linear_head.eval()
@@ -396,10 +453,9 @@ def evaluate_model(linear_head, test_feats, test_labels, class_names):
     print("\nDetailed Per-Class Classification Report (Frozen Probe):")
     print(classification_report(targets, preds, target_names=class_names, digits=4, zero_division=0))
     
-    # Save Confusion Matrix Plot
     plt.figure(figsize=(12, 10))
     plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    plt.title("Quadtree-JEPA Frozen Linear Probe Confusion Matrix")
+    plt.title("Quadtree-JEPA V2 Frozen Probe Confusion Matrix")
     plt.colorbar()
     tick_marks = np.arange(len(class_names))
     plt.xticks(tick_marks, class_names, rotation=35, ha="right", fontsize=8)
@@ -462,7 +518,7 @@ def evaluate_finetuned_model(classifier, test_dataset, class_names):
     
     plt.figure(figsize=(12, 10))
     plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Greens)
-    plt.title("Quadtree-JEPA Fine-Tuned Confusion Matrix")
+    plt.title("Quadtree-JEPA V2 Fine-Tuned Confusion Matrix")
     plt.colorbar()
     tick_marks = np.arange(len(class_names))
     plt.xticks(tick_marks, class_names, rotation=35, ha="right", fontsize=8)
@@ -486,6 +542,7 @@ def evaluate_finetuned_model(classifier, test_dataset, class_names):
     plt.close()
     print(f" Fine-tuned confusion matrix plot saved to: {os.path.abspath(plot_path)}")
     return acc, f1
+
 # ==========================================
 # MAIN EXECUTION FLOW
 # ==========================================
@@ -499,7 +556,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  QUADTREE-JEPA END-TO-END BENCHMARK PIPELINE")
+    print("  QUADTREE-JEPA END-TO-END BENCHMARK PIPELINE (V2)")
     print(f"  Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     print("=" * 70)
     
@@ -508,6 +565,7 @@ def main():
     eval_train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=False)
     test_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "test"), target_size=TARGET_SIZE, is_train=False)
     num_classes = len(train_dataset.classes)
+    class_weights = compute_class_weights(train_dataset, num_classes=num_classes)
     
     print(f"Classes ({num_classes}): {train_dataset.classes}")
     print(f"Training samples: {len(train_dataset):,} | Testing samples: {len(test_dataset):,}\n")
@@ -531,12 +589,13 @@ def main():
         emb_dropout=0.1
     ).to(device)
     
-    model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM, max_seq_len=MAX_SEQ_LEN).to(device)
+    model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM, max_seq_len=MAX_SEQ_LEN, target_budget=TARGET_BUDGET).to(device)
     
     param_groups = [
         {"params": model.context_encoder.parameters()},
         {"params": model.predictor.parameters()},
-        {"params": model.z_bridge.parameters()}
+        {"params": model.z_bridge.parameters()},
+        {"params": model.pooler.parameters()}
     ]
     optimizer = torch.optim.AdamW(param_groups, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.pretrain_epochs, eta_min=1e-6)
@@ -550,9 +609,9 @@ def main():
         print(f"\n[*] --eval_only mode active. Loading checkpoint: {ckpt}")
         if os.path.exists(ckpt):
             try:
-                model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=False))
+                model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=False), strict=False)
             except TypeError:
-                model.load_state_dict(torch.load(ckpt, map_location=device))
+                model.load_state_dict(torch.load(ckpt, map_location=device), strict=False)
             print(f"[*] Successfully loaded weights from {ckpt}\n")
         else:
             raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
@@ -560,17 +619,17 @@ def main():
         run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=args.resume, total_epochs=args.pretrain_epochs)
     
     # 4. Phase 2A: Feature Extraction & Linear Probe Training (Frozen Backbone)
-    train_feats, train_labels = extract_dataset_embeddings(model, eval_train_dataset, cache_name="train_embeddings_cache")
-    test_feats, test_labels = extract_dataset_embeddings(model, test_dataset, cache_name="test_embeddings_cache")
+    train_feats, train_labels = extract_dataset_embeddings(model, eval_train_dataset, cache_name="train_embeddings_cache_v2")
+    test_feats, test_labels = extract_dataset_embeddings(model, test_dataset, cache_name="test_embeddings_cache_v2")
     
-    linear_head = train_linear_probe(train_feats, train_labels, num_classes=num_classes, epochs=args.probe_epochs)
+    linear_head = train_linear_probe(train_feats, train_labels, num_classes=num_classes, epochs=args.probe_epochs, class_weights=class_weights)
     
     # 5. Phase 3A: Immediate Frozen Linear Probe Benchmark Evaluation
     print("\n[*] Immediate Evaluation: Computing Frozen Linear Probe Benchmark Scores...")
     evaluate_model(linear_head, test_feats, test_labels, train_dataset.classes)
     
     # 6. Phase 2B: End-to-End Discriminative Fine-Tuning (Unfrozen Backbone)
-    ft_classifier = train_finetuned_classifier(model, train_dataset, num_classes=num_classes, epochs=args.finetune_epochs)
+    ft_classifier = train_finetuned_classifier(model, train_dataset, num_classes=num_classes, epochs=args.finetune_epochs, class_weights=class_weights)
     
     # 7. Phase 3B: Fine-Tuned Benchmark Evaluation
     evaluate_finetuned_model(ft_classifier, test_dataset, train_dataset.classes)
