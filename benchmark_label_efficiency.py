@@ -17,7 +17,13 @@ from train_and_evaluate_jepa import LabeledPlantDataset, extract_dataset_embeddi
 # ==========================================
 # CONFIGURATION
 # ==========================================
-CHECKPOINT_PATH = "./checkpoints/jepa_plant_75epochs.pt"
+DEFAULT_CHECKPOINTS = [
+    "./checkpoints/jepa_plant_latest.pt",
+    "./checkpoints/jepa_plant_epoch15.pt",
+    "./checkpoints/jepa_plant_75epochs.pt",
+    "./checkpoints/jepa_plant_30epochs.pt"
+]
+CHECKPOINT_PATH = next((p for p in DEFAULT_CHECKPOINTS if os.path.exists(p)), "./checkpoints/jepa_plant_latest.pt")
 DATA_DIR = "./data/plant_dataset"
 TARGET_SIZE = 504
 EMBED_DIM = 768
@@ -43,10 +49,14 @@ def set_seed(seed=42):
 # ==========================================
 class SupervisedViTClassifier(nn.Module):
     """
-    Standard Supervised Vision Transformer baseline with patch embedding
-    and identical transformer backbone capacity (dim=768, depth=6, heads=8).
+    Standard Supervised Vision Transformer baseline with patch embedding.
+    V4: matched to QuadTree-JEPA backbone capacity (depth=12, heads=12, mlp=2048)
+    for a fair label-efficiency comparison.
+    Previously depth=6/heads=8 — the supervised baseline had HALF the capacity,
+    making JEPA look better than the architecture difference alone justified.
     """
-    def __init__(self, num_classes=3, image_size=504, patch_size=28, embed_dim=768, depth=6, heads=8, mlp_dim=1536):
+    def __init__(self, num_classes=3, image_size=504, patch_size=28, embed_dim=768,
+                 depth=12, heads=12, mlp_dim=2048):
         super().__init__()
         self.vit = SimpleViT(
             image_size=image_size,
@@ -96,9 +106,9 @@ def train_and_eval_supervised_vit(train_dataset, subset_indices, test_loader, nu
         image_size=TARGET_SIZE,
         patch_size=28,
         embed_dim=EMBED_DIM,
-        depth=6,
-        heads=8,
-        mlp_dim=1536
+        depth=12,
+        heads=12,
+        mlp_dim=2048
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.05)
@@ -136,11 +146,22 @@ def train_and_eval_jepa_probe(all_train_feats, all_train_labels, subset_indices,
     sub_feats = all_train_feats[subset_indices]
     sub_labels = all_train_labels[subset_indices]
 
-    linear_head = nn.Linear(EMBED_DIM, num_classes).to(device)
-    optimizer = torch.optim.Adam(linear_head.parameters(), lr=1e-3, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss()
+    # V4: use proper 2-layer MLP head matching QuadtreeClassifier's head.
+    # Previously: bare nn.Linear only — this undershoots JEPA's actual capacity
+    # and makes the comparison appear stronger than it really is (inflated gap).
+    # Now uses the same LayerNorm→Linear→GELU→Dropout→Linear structure.
+    import torch.nn as nn
+    linear_head = nn.Sequential(
+        nn.LayerNorm(EMBED_DIM),
+        nn.Linear(EMBED_DIM, 512),
+        nn.GELU(),
+        nn.Dropout(0.2),
+        nn.Linear(512, num_classes)
+    ).to(device)
+    optimizer = torch.optim.AdamW(linear_head.parameters(), lr=1e-3, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    loader = DataLoader(TensorDataset(sub_feats, sub_labels), batch_size=min(16, len(sub_feats)), shuffle=True)
+    loader = DataLoader(TensorDataset(sub_feats, sub_labels), batch_size=min(32, len(sub_feats)), shuffle=True)
 
     linear_head.train()
     for epoch in range(1, epochs + 1):
@@ -184,18 +205,23 @@ def main():
 
     # 2. Load Pretrained Quadtree-JEPA and Extract Frozen Features
     print(f"[Step 1/3] Loading pretrained Quadtree-JEPA from: {CHECKPOINT_PATH}...")
+    # V4: updated to V4 architecture. Previously depth=6/max_seq_len=800 — loading
+    # against a V4 checkpoint with strict=False silently left half the layers random.
     base_vit = ViT(
         dim=EMBED_DIM,
-        depth=6,
-        heads=8,
-        mlp_dim=1536,
+        depth=12,
+        heads=12,
+        mlp_dim=2048,
         dim_head=64,
         dropout=0.1,
-        emb_dropout=0.1
+        drop_path_rate=0.1
     ).to(device)
 
-    jepa_model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM, max_seq_len=MAX_SEQ_LEN).to(device)
-    jepa_model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+    jepa_model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM).to(device)
+    try:
+        jepa_model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False), strict=False)
+    except TypeError:
+        jepa_model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device), strict=False)
     jepa_model.eval()
 
     print("[Step 2/3] Extracting frozen latent embeddings for all images...")

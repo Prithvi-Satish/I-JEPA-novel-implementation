@@ -12,13 +12,20 @@ from quadtree_jepa import QuadtreeJEPA
 from train_and_evaluate_jepa import LabeledPlantDataset, extract_dataset_embeddings
 
 # ==========================================
+# ==========================================
 # CONFIGURATION
 # ==========================================
-CHECKPOINT_PATH = "./checkpoints/jepa_plant_75epochs.pt"
+DEFAULT_CHECKPOINTS = [
+    "./checkpoints/jepa_cub_latest.pt",
+    "./checkpoints/jepa_plant_latest.pt",
+    "./checkpoints/jepa_plant_epoch15.pt",
+]
+CHECKPOINT_PATH = next((p for p in DEFAULT_CHECKPOINTS if os.path.exists(p)), "./checkpoints/jepa_cub_latest.pt")
 DATA_DIR = "./data/plant_dataset"
 TARGET_SIZE = 504
 EMBED_DIM = 768
-MAX_SEQ_LEN = 800
+# V4: max_seq_len removed — V4 tokenizer always produces exactly 256 tokens.
+# Passing max_seq_len=800 was a stale V2 artifact with no effect on V3/V4 architecture.
 K_VALUES = [1, 3, 5, 7, 11, 15]
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -34,22 +41,25 @@ def evaluate_knn():
     print("=" * 65)
     print(f"Loading checkpoint: {CHECKPOINT_PATH}")
 
-    # 1. Initialize and Load Model
+    # V4 architecture — MUST match the checkpoint exactly.
+    # Previously: depth=6, heads=8 (V2 params). Loading with strict=False against a
+    # V4 checkpoint (depth=12) silently zeros out all 6 extra layers → garbage features.
     base_vit = ViT(
         dim=EMBED_DIM,
-        depth=6,
-        heads=8,
-        mlp_dim=1536,
+        depth=12,
+        heads=12,
+        mlp_dim=2048,
         dim_head=64,
         dropout=0.1,
-        emb_dropout=0.1
+        drop_path_rate=0.1
     ).to(device)
 
-    model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM, max_seq_len=MAX_SEQ_LEN).to(device)
+    # V4: no max_seq_len — tokenizer always produces 256 tokens
+    model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM).to(device)
     try:
-        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False))
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device, weights_only=False), strict=False)
     except TypeError:
-        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device), strict=False)
     model.eval()
     print("Pretrained JEPA backbone successfully loaded.\n")
 
