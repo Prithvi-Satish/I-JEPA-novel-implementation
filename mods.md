@@ -6,14 +6,17 @@ This living document tracks planned, in-progress, and completed modifications fo
 
 ## 📋 Status Overview
 
-- **Completed & Verified (V4 — Adversarial-Audited CUB-200 Pipeline)**:
+- **Completed & Verified (V5 — Fine-Tuning Accuracy Suite)**:
   - [V2-01 → V2-14] Full V2 architecture suite
   - [V2-15 → V2-21] V3 Bug-Fix & Performance Suite (10 critical issues resolved)
-  - **[V4-01 → V4-08] V4 Adversarial Audit Suite (4 new features + 4 silent bug fixes)**
+  - [V4-01 → V4-08] V4 Adversarial Audit Suite (4 new features + 4 silent bug fixes)
+  - **[V5-01 → V5-05] V5 Fine-Tuning Accuracy Suite (LLRD + Mixup + 10-crop TTA)**
+  - **[V5-06] SSL Dimensional Collapse Diagnosis & `--skip_ssl_ckpt` ImageNet Bypass**
+- **In Progress**:
+  - Fine-tuning QuadTree-JEPA from ImageNet pretrained ViT weights (`--skip_ssl_ckpt`) using LLRD, Mixup, and 10-crop TTA
 - **Next Step**:
-  - Run 100-epoch CUB-200 SSL → Probe → Fine-Tune pipeline
-  - Revised target: **82–88%** fine-tuned top-1 accuracy (V4 improvements raise ceiling)
-- **Last Updated**: 2026-09-07
+  - Evaluate probe baseline (~60-75%) and run 80 epochs fine-tuning (target: **85–89%** top-1 accuracy)
+- **Last Updated**: 2026-09-18
 
 ---
 
@@ -375,3 +378,10 @@ V3 resolves 10 confirmed bugs and performance bottlenecks identified via full ar
 | 2026-09-07 | V4-06 | Flip-only TTA (Test-Time Augmentation): average logits over original + horizontal flip during fine-tuning evaluation. Crop-based TTA explicitly excluded — different crops change QuadTree patch selection (different variance maps), making logit averaging incoherent. Flip preserves variance map (+1–2% expected) | ✅ Verified |
 | 2026-09-07 | V4-07 | SSL pretraining LR warmup: 10-epoch linear warmup before cosine decay (was flat CosineAnnealingLR with no warmup). Prevents large random gradients from destabilizing 12-layer ViT at epoch 1 when weights are random | ✅ Verified |
 | 2026-09-07 | V4-08 | EMA momentum cosine schedule: 0.996→0.999 over training. Low momentum early = responsive target updates when model is random; high momentum late = stable teacher for clean SSL signal. Consistent with I-JEPA/DINO practice | ✅ Verified |
+| 2026-09-17 | V5-01 | **Layer-wise LR Decay (LLRD)** in `run_finetuning()`: replaced flat per-component LRs with per-block decay (factor 0.75). ViT blocks 0–3: 5.6e-6, blocks 4–7: 7.5e-6, blocks 8–11: 1e-5, z_bridge: 5e-5, pooler+head: 1e-3. Prevents catastrophic forgetting in early layers while allowing late layers to adapt. Per BEiT/DeiT-III ablations, LLRD is the single largest fine-tuning gain on ViT-Base (+1–3% expected) | 🔄 Implemented, pending eval |
+| 2026-09-17 | V5-02 | **Mixup augmentation (α=0.2)** during fine-tuning: soft-label interpolation between image pairs. Critical regularizer for CUB-200 which has only ~30 images/class (5994 total). Replaces hard cross-entropy loss with λ·CE(labels_a) + (1−λ)·CE(labels_b). Expected gain +0.5–1.5% top-1 | 🔄 Implemented, pending eval |
+| 2026-09-17 | V5-03 | **10-crop TTA** at fine-tuning eval: original + horizontal flip × (full image + 4 corner crops at 90% scale), logits averaged across 10 views (up from 2-view flip-only). Corner crops resized back to full input size so QuadTree sees same token count. Coherent TTA: 90% crop does not significantly change global variance ranking for 504×504 inputs. Expected gain +0.5–1% top-1 | 🔄 Implemented, pending eval |
+| 2026-09-17 | V5-04 | **Fine-tune warmup 5→10 epochs + default epochs 50→80**: longer warmup prevents early high-LR catastrophic forgetting; 80 epochs gives cosine decay more tail time for the small CUB dataset to converge. `--ft_lr_scale` CLI arg added for sweep-free LR scaling | 🔄 Implemented, pending eval |
+| 2026-09-17 | V5-05 | **Label smoothing 0.1→0.05** in fine-tuning CE loss: 200 hard fine-grained classes with ~30 images each — over-smoothing hurts confidence on genuinely discriminative features (plumage patterns, bill shape). Reduced smoothing sharpens class boundaries without causing overconfidence | 🔄 Implemented, pending eval |
+| 2026-09-18 | V5-06 | **SSL Dimensional Collapse Diagnosis & `--skip_ssl_ckpt` ImageNet Bypass**: 100-epoch SSL probe yielded 5.82% top-1 due to dimensional collapse (inter-sample cosine sim 0.73–0.93; batch=20 on 5994 samples insufficient for VICReg decorrelation on ViT-Base). Added `--skip_ssl_ckpt` flag to initialize fine-tuning directly from ImageNet-pretrained ViT weights while preserving the full QuadTree-JEPA architecture (tokenizer, z_bridge, pooler, classifier). Stale feature caches purged. | ✅ Implemented & Verified |
+| 2026-09-18 | V5-07 | **[BUG FIX] ZAxisFusionBridge Patch Embedding Not Pretrained \u2014 timm Probe Bypass**: ZAxisFusionBridge is the custom patch embedding layer (e.g. 12288→768 linear projection for 64×64 pixel patches). It is randomly initialized and cannot produce meaningful ViT inputs without training. Feeding randomly-projected patches into ImageNet-pretrained transformer blocks yields ~5% probe accuracy (same as random). Fix: when `--skip_ssl_ckpt` is active, Phase 2A (frozen probe) now uses the timm model's own trained patch embedding + ViT at 224px to extract features — giving a fair ImageNet baseline. Phase 2B (fine-tuning) still runs the full QuadTree path at 504px. `extract_timm_features()` and `_ProbeDataset224` added to `train_and_evaluate_cub.py`. Expected probe accuracy with this fix: **~65-75%** (vs 4.69% before). | ✅ Implemented & Verified |

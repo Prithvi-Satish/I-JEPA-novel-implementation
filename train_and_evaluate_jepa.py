@@ -16,28 +16,29 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix, classification_report
 
-from vit_pytorch.vit import ViT
+import math
+from vit_pytorch.vit import ViT, load_pretrained_vit_weights
 from quadtree_jepa import QuadtreeJEPA, QuadtreeClassifier, ScaleAwareAttentivePool
 
 # ==========================================
 # HYPERPARAMETERS & CONFIGURATION (V2)
 # ==========================================
-PRETRAIN_EPOCHS = 30
-PROBE_EPOCHS = 30
-FINETUNE_EPOCHS = 20
-BATCH_SIZE = 1  # Dynamic quadtree sequence lengths processed per image
-GRAD_ACCUM_STEPS = 16
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 0.05
+PRETRAIN_EPOCHS   = 30
+PROBE_EPOCHS      = 30
+FINETUNE_EPOCHS   = 20
+BATCH_SIZE        = 1      # 1 image per step; accumulate 16 steps → effective batch 16
+GRAD_ACCUM_STEPS  = 16
+WARMUP_EPOCHS     = 10    # Linear LR warmup before cosine decay
+WEIGHT_DECAY      = 0.05
 EMA_MOMENTUM_START = 0.996
-EMA_MOMENTUM_END = 0.9999
-EMBED_DIM = 768
-MAX_SEQ_LEN = 800
-TARGET_BUDGET = 256
-TARGET_SIZE = 504
-NUM_WORKERS = 0 if os.name == 'nt' else 4
-CHECKPOINT_INTERVAL = 5  # Save checkpoint every 5 epochs
-CHECKPOINT_DIR = "./checkpoints"
+EMA_MOMENTUM_END  = 0.999  # Cosine-annealed EMA momentum
+EMBED_DIM         = 768
+MAX_SEQ_LEN       = 800
+TARGET_BUDGET     = 256
+TARGET_SIZE       = 504
+NUM_WORKERS       = 0 if os.name == 'nt' else 4
+CHECKPOINT_INTERVAL = 5   # Save checkpoint every 5 epochs
+CHECKPOINT_DIR    = "./checkpoints"
 DATA_DIR = "./data/plant_dataset"
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -156,7 +157,7 @@ class TrainingMonitor:
 # ==========================================
 # PHASE 1: SELF-SUPERVISED PRE-TRAINING (V2 HYBRID ACCELERATION)
 # ==========================================
-def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=None, total_epochs=PRETRAIN_EPOCHS):
+def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=None, total_epochs=PRETRAIN_EPOCHS, is_pretrained=True):
     start_epoch = 1
     if resume_path and os.path.exists(resume_path):
         print(f"\n[*] Resuming QuadTree-JEPA pre-training from: {resume_path}")
@@ -173,9 +174,11 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
             scheduler.step()
 
     print("=" * 70)
-    print(f"  PHASE 1: SELF-SUPERVISED QUADTREE-JEPA PRE-TRAINING ({total_epochs} EPOCHS)")
-    print(f"  V2: Hybrid Image-Relative Variance + Quantile Budget Top-K Allocation")
-    print(f"  Acceleration: Mixed Precision (AMP FP16: {use_amp}) | Workers: {NUM_WORKERS}")
+    print(f"  PHASE 1: SELF-SUPERVISED QUADTREE-JEPA PRE-TRAINING V3 ({total_epochs} EPOCHS)")
+    print(f"  Backbone: ViT-Base depth=12 | ImageNet Pretrained: {is_pretrained}")
+    print(f"  Warmup: {WARMUP_EPOCHS} epochs | EMA: {EMA_MOMENTUM_START}→{EMA_MOMENTUM_END} (cosine)")
+    print(f"  VICReg: lambda=25, mu=25, nu=1 | AMP: {use_amp} | Workers: {NUM_WORKERS}")
+    print(f"  SSL Aug: RandomResizedCrop + GaussianBlur [Solarize excluded]")
     print("=" * 70)
     
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -189,7 +192,9 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
         running_loss = 0.0
         valid_steps = 0
         
-        alpha = EMA_MOMENTUM_START + (EMA_MOMENTUM_END - EMA_MOMENTUM_START) * (epoch / total_epochs)
+        # Cosine-annealed EMA momentum: starts responsive (0.996) → stable (0.999)
+        progress = (epoch - 1) / max(total_epochs - 1, 1)
+        alpha = EMA_MOMENTUM_END - (EMA_MOMENTUM_END - EMA_MOMENTUM_START) * (math.cos(math.pi * progress) + 1) / 2
         
         last_valid_pred = None
         last_valid_true = None
@@ -246,14 +251,14 @@ def run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_p
                             cov_loss = torch.tensor(0.0, device=all_pred_tokens.device)
                         
                         mean_align_loss = torch.stack(accum_align_losses).mean()
-                        total_loss = (mean_align_loss * 10.0) + variance_loss + (cov_loss * 0.02)
+                        # VICReg: lambda=25 (invariance), mu=25 (variance), nu=1 (covariance)
+                        # Matches the CUB pipeline — the correctly tuned formulation.
+                        total_loss = (25.0 * mean_align_loss) + (25.0 * variance_loss) + (1.0 * cov_loss)
                     
                     scaler.scale(total_loss).backward()
                     scaler.unscale_(optimizer)
                     
-                    nn.utils.clip_grad_norm_(model.context_encoder.parameters(), max_norm=1.0)
-                    nn.utils.clip_grad_norm_(model.predictor.parameters(), max_norm=1.0)
-                    nn.utils.clip_grad_norm_(model.z_bridge.parameters(), max_norm=1.0)
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     
                     scaler.step(optimizer)
                     scaler.update()
@@ -547,58 +552,105 @@ def evaluate_finetuned_model(classifier, test_dataset, class_names):
 # MAIN EXECUTION FLOW
 # ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="QuadTree-JEPA Training and Dual Evaluation Pipeline")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from")
-    parser.add_argument("--eval_only", action="store_true", help="Skip pretraining and run linear probe + fine-tuning directly")
-    parser.add_argument("--pretrain_epochs", type=int, default=PRETRAIN_EPOCHS, help="Total pretrain epochs")
-    parser.add_argument("--probe_epochs", type=int, default=PROBE_EPOCHS, help="Probe epochs")
-    parser.add_argument("--finetune_epochs", type=int, default=FINETUNE_EPOCHS, help="Fine-tuning epochs")
+    parser = argparse.ArgumentParser(description="QuadTree-JEPA V3 Training and Dual Evaluation Pipeline")
+    parser.add_argument("--resume",           type=str, default=None,
+                        help="Path to checkpoint .pt to resume from")
+    parser.add_argument("--eval_only",        action="store_true",
+                        help="Skip pretraining and run linear probe + fine-tuning directly")
+    parser.add_argument("--no_pretrained",    action="store_true",
+                        help="Train ViT backbone from scratch instead of loading ImageNet weights")
+    parser.add_argument("--pretrained_model", type=str, default="vit_base_patch16_224",
+                        help="timm model name for pretrained ViT weights (default: vit_base_patch16_224)")
+    parser.add_argument("--pretrain_epochs",  type=int, default=PRETRAIN_EPOCHS)
+    parser.add_argument("--probe_epochs",     type=int, default=PROBE_EPOCHS)
+    parser.add_argument("--finetune_epochs",  type=int, default=FINETUNE_EPOCHS)
     args = parser.parse_args()
 
     print("=" * 70)
-    print("  QUADTREE-JEPA END-TO-END BENCHMARK PIPELINE (V2)")
+    print("  QUADTREE-JEPA END-TO-END BENCHMARK PIPELINE (V3 — PRETRAINED BACKBONE)")
     print(f"  Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
     print("=" * 70)
-    
+
     # 1. Prepare Datasets & Loaders
-    train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=True)
+    train_dataset      = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=True)
     eval_train_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "train"), target_size=TARGET_SIZE, is_train=False)
-    test_dataset = LabeledPlantDataset(os.path.join(DATA_DIR, "test"), target_size=TARGET_SIZE, is_train=False)
-    num_classes = len(train_dataset.classes)
-    class_weights = compute_class_weights(train_dataset, num_classes=num_classes)
-    
+    test_dataset       = LabeledPlantDataset(os.path.join(DATA_DIR, "test"),  target_size=TARGET_SIZE, is_train=False)
+    num_classes        = len(train_dataset.classes)
+    class_weights      = compute_class_weights(train_dataset, num_classes=num_classes)
+
     print(f"Classes ({num_classes}): {train_dataset.classes}")
     print(f"Training samples: {len(train_dataset):,} | Testing samples: {len(test_dataset):,}\n")
-    
+
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=BATCH_SIZE, 
-        shuffle=True, 
-        num_workers=NUM_WORKERS, 
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
         pin_memory=torch.cuda.is_available()
     )
-    
-    # 2. Build Model
+
+    # 2. Build Model — V3: ViT-Base (depth=12) matching CUB pipeline capacity
+    # GPU VRAM budget: depth=12, batch=1, accum=16 → ~3.5 GB → safe on 8GB RTX
     base_vit = ViT(
-        dim=EMBED_DIM,
-        depth=6,
-        heads=8,
-        mlp_dim=1536,
-        dim_head=64,
-        dropout=0.1,
-        emb_dropout=0.1
+        dim           = EMBED_DIM,
+        depth         = 12,           # ViT-Base standard (was depth=6)
+        heads         = 12,           # 12 * 64 = 768 = dim
+        mlp_dim       = 3072,         # Standard ViT-Base FFN (4 * 768)
+        dim_head      = 64,
+        dropout       = 0.1,
+        drop_path_rate= 0.1,          # Stochastic depth for depth=12
+        qkv_bias      = True
     ).to(device)
-    
-    model = QuadtreeJEPA(base_vit=base_vit, embed_dim=EMBED_DIM, max_seq_len=MAX_SEQ_LEN, target_budget=TARGET_BUDGET).to(device)
-    
-    param_groups = [
-        {"params": model.context_encoder.parameters()},
-        {"params": model.predictor.parameters()},
-        {"params": model.z_bridge.parameters()},
-        {"params": model.pooler.parameters()}
-    ]
-    optimizer = torch.optim.AdamW(param_groups, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.pretrain_epochs, eta_min=1e-6)
+
+    # Load ImageNet pre-trained weights (transfers 100% of transformer blocks)
+    is_pretrained = not args.no_pretrained
+    if is_pretrained:
+        load_pretrained_vit_weights(base_vit, model_name=args.pretrained_model)
+    else:
+        print("[*] --no_pretrained: training ViT backbone from random initialization")
+
+    model = QuadtreeJEPA(
+        base_vit=base_vit, embed_dim=EMBED_DIM,
+        max_seq_len=MAX_SEQ_LEN, target_budget=TARGET_BUDGET
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    print(f"Model: QuadTree-JEPA V3 | Params: {n_params:.1f}M | Pretrained: {is_pretrained}")
+
+    # V3: Differential LRs — pre-trained backbone gets a gentle nudge (2e-5)
+    # while newly initialized Z-bridge and predictor learn rapidly (2e-4).
+    # Equal LRs would either destroy pretrained weights (too high) or
+    # fail to adapt the bridge (too low).
+    if is_pretrained:
+        backbone_params = list(model.context_encoder.parameters())
+        new_params = (
+            list(model.z_bridge.parameters()) +
+            list(model.predictor.parameters()) +
+            list(model.pooler.parameters())
+        )
+        try:
+            new_params += list(model.target_norm.parameters())
+        except AttributeError:
+            pass  # target_norm may not exist in older checkpoint states
+        optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': 2e-5, 'weight_decay': WEIGHT_DECAY},
+            {'params': new_params,      'lr': 2e-4, 'weight_decay': WEIGHT_DECAY},
+        ])
+        print("  Optimizer: Differential LRs (Backbone: 2e-5, Z-Bridge+Predictor: 2e-4)")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=WEIGHT_DECAY)
+        print("  Optimizer: Uniform LR=1e-4 (from-scratch training)")
+
+    # V3: Warmup + cosine decay scheduler (10-epoch linear warmup, then cosine)
+    # Large random gradients from the Z-bridge at epoch 1 can destabilize
+    # the pretrained backbone without warmup.
+    def ssl_lr_lambda(epoch):
+        if epoch < WARMUP_EPOCHS:
+            return float(epoch + 1) / float(WARMUP_EPOCHS)
+        progress = float(epoch - WARMUP_EPOCHS) / float(max(1, args.pretrain_epochs - WARMUP_EPOCHS))
+        return 0.5 * (1.0 + math.cos(math.pi * progress)) * (1.0 - 1e-6) + 1e-6
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, ssl_lr_lambda)
+
     monitor = TrainingMonitor()
     
     # 3. Phase 1: Pre-training (or load checkpoint if --eval_only)
@@ -616,7 +668,7 @@ def main():
         else:
             raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
     else:
-        run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=args.resume, total_epochs=args.pretrain_epochs)
+        run_pretraining(model, train_loader, optimizer, scheduler, monitor, resume_path=args.resume, total_epochs=args.pretrain_epochs, is_pretrained=is_pretrained)
     
     # 4. Phase 2A: Feature Extraction & Linear Probe Training (Frozen Backbone)
     train_feats, train_labels = extract_dataset_embeddings(model, eval_train_dataset, cache_name="train_embeddings_cache_v2")
